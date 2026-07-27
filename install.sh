@@ -12,17 +12,21 @@ RUN_AS_USER="${SUDO_USER:-$(whoami)}"
 
 echo "==> Installing CCTV app to $INSTALL_DIR (running as user: $RUN_AS_USER)"
 
-# System deps needed for OpenCV + camera access
+# System deps needed for OpenCV + camera access.
+# IMPORTANT: python3-opencv comes from apt, NOT pip. The pip wheel
+# (opencv-python-headless) is built with AVX2 and crashes with "Illegal
+# instruction" on older CPUs (Celeron/Pentium) that lack AVX support.
 apt-get update
-apt-get install -y python3 python3-venv python3-pip
+apt-get install -y python3 python3-venv python3-pip python3-opencv
 
 # Copy app code into /opt (keeps your git repo clean, separate from the running deployment)
 mkdir -p "$INSTALL_DIR"
 cp -r "$REPO_DIR"/app.py "$REPO_DIR"/requirements.txt "$INSTALL_DIR"/
 
-# Set up virtual environment
+# Set up virtual environment with access to system packages (so it can see
+# the apt-installed opencv instead of trying to pip-install a broken wheel)
 if [ ! -d "$INSTALL_DIR/venv" ]; then
-    python3 -m venv "$INSTALL_DIR/venv"
+    python3 -m venv --system-site-packages "$INSTALL_DIR/venv"
 fi
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"

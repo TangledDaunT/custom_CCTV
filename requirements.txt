@@ -1,2 +1,6 @@
 flask==3.0.3
-opencv-python-headless==4.10.0.84
+# NOTE: opencv is intentionally NOT installed via pip here.
+# The pip wheel (opencv-python-headless) is compiled with AVX2 instructions
+# and will crash with "Illegal instruction" (SIGILL) on older CPUs (e.g. Celeron/Pentium)
+# that don't support AVX. install.sh installs OpenCV via apt (python3-opencv) instead,
+# which is built for a generic baseline instruction set.
