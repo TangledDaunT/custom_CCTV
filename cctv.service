@@ -1,0 +1,17 @@
+[Unit]
+Description=CCTV Live Feed Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_AS_USER__
+WorkingDirectory=/opt/cctv-app
+ExecStart=/opt/cctv-app/venv/bin/python /opt/cctv-app/app.py
+Restart=always
+RestartSec=3
+# Keep it from eating all RAM if something goes wrong
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
