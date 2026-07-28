@@ -29,8 +29,8 @@ MOTION_FRAMES_TRIGGER   = 3
 MOTION_BLUR_SIZE        = 21
 
 # Schedule — motion alerts only active between these hours (24h)
-SCHEDULE_START_HOUR = 23   # 11 PM
-SCHEDULE_END_HOUR   = 6    #  6 AM
+SCHEDULE_START_HOUR = 6   # 11 PM
+SCHEDULE_END_HOUR   = 13    #  6 AM
 
 # WhatsApp
 WACLI_PATH    = "/home/linuxbrew/.linuxbrew/bin/wacli"
