@@ -30,7 +30,7 @@ class MotionDetector:
         cooldown_seconds=10,     # Minimum seconds between two motion events
         motion_frames_trigger=3, # Consecutive frames with motion before firing event
         history=500,             # MOG2 background history frames
-        var_threshold=40,        # MOG2 variance threshold
+        var_threshold=40,        # MOG2 variance threshold — lower = more sensitive
     ):
         self.min_area = min_area
         self.threshold = threshold
@@ -38,6 +38,8 @@ class MotionDetector:
         self.dilate_iterations = dilate_iterations
         self.cooldown_seconds = cooldown_seconds
         self.motion_frames_trigger = motion_frames_trigger
+        self._history = history
+        self._var_threshold = var_threshold
 
         # MOG2: best balance of speed vs accuracy for static cameras
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -185,7 +187,7 @@ class MotionDetector:
     def reset_background(self):
         """Force the background model to reset — useful after scene changes."""
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=40, detectShadows=False
+            history=self._history, varThreshold=self._var_threshold, detectShadows=False
         )
         logger.info("Background model reset")
 
