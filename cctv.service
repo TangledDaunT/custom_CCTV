@@ -1,38 +1,21 @@
 [Unit]
-Description=CCTV Streaming + Motion Detection
-After=network.target
-StartLimitIntervalSec=0
+Description=CCTV Live Feed Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=__RUN_AS_USER__
 WorkingDirectory=/opt/cctv-app
-
-# Create log dir before starting
-ExecStartPre=/bin/mkdir -p /var/log/cctv
-ExecStartPre=/bin/chown __RUN_AS_USER__ /var/log/cctv
-
-# Give camera time to be ready at boot
-ExecStartPre=/bin/sleep 5
-
-ExecStart=/opt/cctv-app/venv/bin/python app.py
-
-# Always restart — no matter what killed it
+ExecStart=/opt/cctv-app/venv/bin/python /opt/cctv-app/app.py
 Restart=always
-RestartSec=5
-
-# Resource limits — keep it lean on old hardware
-MemoryMax=800M
-CPUQuota=80%
-
-# Logging to journald
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=cctv
-
-# Kill cleanly
-KillSignal=SIGTERM
+RestartSec=3
+# Keep it from eating all RAM if something goes wrong
+MemoryMax=1G
+# Give the app time to release the camera cleanly on stop/restart
 TimeoutStopSec=10
+# Extra group access to the webcam device, on top of usermod done in install.sh
+SupplementaryGroups=video
 
 [Install]
 WantedBy=multi-user.target

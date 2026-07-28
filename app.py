@@ -5,6 +5,7 @@ import logging.handlers
 import threading
 import subprocess
 import os
+import signal
 import socket
 from datetime import datetime
 from flask import Flask, Response, jsonify, render_template_string
@@ -55,10 +56,13 @@ STATE_FILE = "/tmp/cctv_alerts_enabled"
 app = Flask(__name__)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-_frame_lock    = threading.Lock()
-_latest_frame  = None
-_camera_ok     = False
-_snapshot_lock = threading.Lock()
+_frame_lock      = threading.Lock()
+_latest_frame    = None
+_camera_ok       = False
+_snapshot_lock   = threading.Lock()
+_shutdown_event  = threading.Event()
+_threads_started = False
+_threads_lock    = threading.Lock()
 
 # Alerts enabled flag — load from state file on startup
 def _load_alert_state():
@@ -174,9 +178,11 @@ def whatsapp_command_listener():
     """
     Poll wacli for incoming messages every 5 seconds.
     Responds to 'stop' and 'start' from any of the registered numbers.
+    Outer loop never dies — any unexpected exception is logged and the
+    listener keeps going instead of silently stopping forever.
     """
     logger.info("WhatsApp command listener started")
-    while True:
+    while not _shutdown_event.is_set():
         try:
             result = subprocess.run(
                 [WACLI_PATH, "receive", "--limit", "5"],
@@ -205,7 +211,7 @@ def whatsapp_command_listener():
         except subprocess.TimeoutExpired:
             pass  # Normal — no messages
         except Exception as e:
-            logger.error(f"Command listener error: {e}")
+            logger.error(f"Command listener error: {e}", exc_info=True)
 
         time.sleep(5)
 
@@ -236,29 +242,35 @@ def open_camera():
     return cap
 
 
-def capture_loop():
+def _capture_loop_body():
+    """
+    The actual capture work. Any exception raised in here is caught by the
+    supervisor in capture_loop() below, logged, and the loop restarts —
+    it can never silently kill the camera thread.
+    """
     global _latest_frame, _camera_ok
     frame_interval = 1.0 / TARGET_FPS
 
-    while True:
-        cap = open_camera()
-        if not cap.isOpened():
-            logger.warning("Camera not available — retrying in 5s")
-            _camera_ok = False
-            time.sleep(5)
-            continue
+    cap = open_camera()
+    if not cap.isOpened():
+        logger.warning("Camera not available — retrying in 5s")
+        _camera_ok = False
+        cap.release()
+        time.sleep(5)
+        return
 
-        logger.info("Camera opened successfully")
-        _camera_ok = True
+    logger.info("Camera opened successfully")
+    _camera_ok = True
 
-        while True:
+    try:
+        while not _shutdown_event.is_set():
             t0 = time.monotonic()
             ret, frame = cap.read()
 
             if not ret:
                 logger.warning("Frame grab failed — reconnecting")
                 _camera_ok = False
-                break
+                return
 
             annotated, score, motion_active = detector.process_frame(frame)
 
@@ -286,8 +298,25 @@ def capture_loop():
             sleep_for  = frame_interval - elapsed
             if sleep_for > 0:
                 time.sleep(sleep_for)
-
+    finally:
         cap.release()
+
+
+def capture_loop():
+    """
+    Supervisor wrapper. Starts immediately at process startup (before Flask
+    even boots) and NEVER depends on a viewer connecting. If anything inside
+    _capture_loop_body() throws — a cv2 error, a driver hiccup, anything —
+    it's caught here, logged, and the loop restarts after a short pause
+    instead of the thread dying silently.
+    """
+    global _camera_ok
+    while not _shutdown_event.is_set():
+        try:
+            _capture_loop_body()
+        except Exception as e:
+            logger.error(f"Capture loop crashed, restarting in 3s: {e}", exc_info=True)
+            _camera_ok = False
         time.sleep(2)
 
 
@@ -427,11 +456,42 @@ def reset_background():
     return jsonify({"status": "background model reset"})
 
 
+def start_background_threads():
+    """
+    Starts the camera capture thread and WhatsApp listener exactly once.
+    Called at MODULE LOAD time (not just inside `if __name__ == "__main__"`)
+    so the camera starts immediately when the process starts, regardless of
+    whether it's launched via `python app.py` (dev) or imported by a
+    production WSGI server like gunicorn (`gunicorn app:app`). This is what
+    guarantees the camera never waits for a viewer to connect.
+    """
+    global _threads_started
+    with _threads_lock:
+        if _threads_started:
+            return
+        _threads_started = True
+
+    threading.Thread(target=capture_loop, daemon=True, name="capture").start()
+    threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+    logger.info(f"CCTV background threads started on {socket.gethostname()} "
+                f"— alerts={'ON' if alerts_enabled() else 'OFF'}")
+
+
+def _handle_shutdown(signum, frame):
+    logger.info(f"Received signal {signum} — shutting down gracefully")
+    _shutdown_event.set()
+    # Give the capture thread a moment to release the camera cleanly
+    time.sleep(1)
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
+
+# Start immediately on import — see docstring above for why this matters.
+start_background_threads()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Capture thread
-    threading.Thread(target=capture_loop, daemon=True, name="capture").start()
-    # WhatsApp command listener
-    threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
-    logger.info(f"CCTV starting on {socket.gethostname()} — alerts={'ON' if alerts_enabled() else 'OFF'}")
     app.run(host="0.0.0.0", port=5000, threaded=True)

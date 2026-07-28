@@ -20,8 +20,14 @@ apt-get update
 apt-get install -y python3 python3-venv python3-pip python3-opencv
 
 # Copy app code into /opt (keeps your git repo clean, separate from the running deployment)
+# IMPORTANT: copy ALL .py files, not just app.py — motion.py (and any future
+# modules) must sit alongside app.py or `import motion` fails at startup.
 mkdir -p "$INSTALL_DIR"
-cp -r "$REPO_DIR"/app.py "$REPO_DIR"/requirements.txt "$INSTALL_DIR"/
+cp -r "$REPO_DIR"/*.py "$REPO_DIR"/requirements.txt "$INSTALL_DIR"/
+
+# Log directory used by app.py's RotatingFileHandler
+mkdir -p /var/log/cctv
+chown "$RUN_AS_USER":"$RUN_AS_USER" /var/log/cctv
 
 # Set up virtual environment with access to system packages (so it can see
 # the apt-installed opencv instead of trying to pip-install a broken wheel)
@@ -40,6 +46,12 @@ sed "s/__RUN_AS_USER__/$RUN_AS_USER/" "$REPO_DIR/cctv.service" > /etc/systemd/sy
 systemctl daemon-reload
 systemctl enable cctv
 systemctl restart cctv
+
+WACLI_PATH="/home/linuxbrew/.linuxbrew/bin/wacli"
+if [ ! -x "$WACLI_PATH" ]; then
+    echo "==> WARNING: wacli not found at $WACLI_PATH — WhatsApp alerts will fail."
+    echo "    Make sure wacli is installed at that path, or update WACLI_PATH in app.py."
+fi
 
 echo "==> Done. CCTV app is running forever as a systemd service."
 echo "==> Check status:  sudo systemctl status cctv"
