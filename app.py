@@ -31,7 +31,7 @@ JPEG_QUALITY   = 80
 TARGET_FPS     = 10
 
 # Motion sensitivity — tuned high (lower = more sensitive)
-MOTION_MIN_AREA         = 2000   # was 2500 — catches smaller movements
+MOTION_MIN_AREA         = 2500   # was 2500 — catches smaller movements
 MOTION_COOLDOWN_SECONDS = 10
 MOTION_FRAMES_TRIGGER   = 2      # was 3 — fires faster
 MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up

@@ -43,7 +43,7 @@ Re-running `install.sh` is safe - it just updates the code and restarts the serv
 
 ## Useful commands on the server
 
-```bash
+```bash 
 sudo systemctl status cctv     # is it running?
 sudo systemctl restart cctv    # restart manually
 sudo journalctl -u cctv -f     # live logs
