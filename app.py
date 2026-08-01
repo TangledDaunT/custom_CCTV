@@ -5,7 +5,7 @@ import logging.handlers
 import threading
 import subprocess
 import os
-import signal
+import json
 import socket
 from datetime import datetime
 from flask import Flask, Response, jsonify, render_template_string
@@ -31,7 +31,7 @@ JPEG_QUALITY   = 80
 TARGET_FPS     = 10
 
 # Motion sensitivity — tuned high (lower = more sensitive)
-MOTION_MIN_AREA         = 2500   # was 2500 — catches smaller movements
+MOTION_MIN_AREA         = 500    # was 1500 — catches smaller movements
 MOTION_COOLDOWN_SECONDS = 10
 MOTION_FRAMES_TRIGGER   = 2      # was 3 — fires faster
 MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up
@@ -56,13 +56,10 @@ STATE_FILE = "/tmp/cctv_alerts_enabled"
 app = Flask(__name__)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-_frame_lock      = threading.Lock()
-_latest_frame    = None
-_camera_ok       = False
-_snapshot_lock   = threading.Lock()
-_shutdown_event  = threading.Event()
-_threads_started = False
-_threads_lock    = threading.Lock()
+_frame_lock    = threading.Lock()
+_latest_frame  = None
+_camera_ok     = False
+_snapshot_lock = threading.Lock()
 
 # Alerts enabled flag — load from state file on startup
 def _load_alert_state():
@@ -174,44 +171,75 @@ def send_whatsapp_status(message: str):
 
 
 # ── WhatsApp command listener ─────────────────────────────────────────────────
+# Authorised senders — only these JIDs can control the system
+COMMAND_JIDS = {f"{n}@s.whatsapp.net" for n in ALERT_NUMBERS}
+
 def whatsapp_command_listener():
     """
-    Poll wacli for incoming messages every 5 seconds.
-    Responds to 'stop' and 'start' from any of the registered numbers.
-    Outer loop never dies — any unexpected exception is logged and the
-    listener keeps going instead of silently stopping forever.
+    Poll wacli's local SQLite DB every 5s for new messages.
+    Uses: wacli messages search --json
+    Only reacts to exact 'stop' or 'start' from authorised JIDs,
+    and only to messages newer than the last check time.
     """
-    logger.info("WhatsApp command listener started")
-    while not _shutdown_event.is_set():
+    logger.info("WhatsApp command listener started (DB polling mode)")
+
+    # Start from now — ignore all historical messages
+    last_check = datetime.utcnow()
+
+    while True:
         try:
-            result = subprocess.run(
-                [WACLI_PATH, "receive", "--limit", "5"],
-                timeout=10, capture_output=True, text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for line in result.stdout.strip().splitlines():
-                    line_lower = line.strip().lower()
-                    # Only act on messages from our registered numbers
-                    sender_match = any(n in line for n in ALERT_NUMBERS)
-                    if not sender_match:
+            for keyword in ("stop", "start"):
+                result = subprocess.run(
+                    [WACLI_PATH, "messages", "search", keyword, "--json"],
+                    timeout=10, capture_output=True, text=True,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    continue
+
+                data = json.loads(result.stdout)
+                messages = data.get("data", {}).get("messages", [])
+
+                for msg in messages:
+                    # Only from authorised JIDs
+                    sender = msg.get("SenderJID", "")
+                    if sender not in COMMAND_JIDS:
                         continue
 
-                    if "stop" in line_lower:
-                        if alerts_enabled():
-                            set_alerts_enabled(False)
-                            send_whatsapp_status("🔕 CCTV alerts STOPPED. Send 'start' to resume.")
-                        # else already stopped — ignore
+                    # Only exact command — not "stop the cron job" etc.
+                    text = msg.get("Text", "").strip().lower()
+                    if text != keyword:
+                        continue
 
-                    elif "start" in line_lower:
-                        if not alerts_enabled():
-                            set_alerts_enabled(True)
-                            send_whatsapp_status("🔔 CCTV alerts STARTED. Send 'stop' to pause.")
-                        # else already running — ignore
+                    # Only newer than last check
+                    ts_str = msg.get("Timestamp", "")
+                    try:
+                        msg_time = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+                    except ValueError:
+                        continue
 
+                    if msg_time <= last_check:
+                        continue
+
+                    # Valid new command — act on it
+                    if keyword == "stop" and alerts_enabled():
+                        set_alerts_enabled(False)
+                        logger.info(f"🔕 Alerts STOPPED by {sender}")
+                        send_whatsapp_status("🔕 CCTV alerts STOPPED. Send 'start' to resume.")
+
+                    elif keyword == "start" and not alerts_enabled():
+                        set_alerts_enabled(True)
+                        logger.info(f"🔔 Alerts STARTED by {sender}")
+                        send_whatsapp_status("🔔 CCTV alerts STARTED. Send 'stop' to pause.")
+
+            # Advance the watermark
+            last_check = datetime.utcnow()
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Command listener JSON parse error: {e}")
         except subprocess.TimeoutExpired:
-            pass  # Normal — no messages
+            logger.warning("wacli messages search timed out")
         except Exception as e:
-            logger.error(f"Command listener error: {e}", exc_info=True)
+            logger.error(f"Command listener error: {e}")
 
         time.sleep(5)
 
@@ -242,35 +270,29 @@ def open_camera():
     return cap
 
 
-def _capture_loop_body():
-    """
-    The actual capture work. Any exception raised in here is caught by the
-    supervisor in capture_loop() below, logged, and the loop restarts —
-    it can never silently kill the camera thread.
-    """
+def capture_loop():
     global _latest_frame, _camera_ok
     frame_interval = 1.0 / TARGET_FPS
 
-    cap = open_camera()
-    if not cap.isOpened():
-        logger.warning("Camera not available — retrying in 5s")
-        _camera_ok = False
-        cap.release()
-        time.sleep(5)
-        return
+    while True:
+        cap = open_camera()
+        if not cap.isOpened():
+            logger.warning("Camera not available — retrying in 5s")
+            _camera_ok = False
+            time.sleep(5)
+            continue
 
-    logger.info("Camera opened successfully")
-    _camera_ok = True
+        logger.info("Camera opened successfully")
+        _camera_ok = True
 
-    try:
-        while not _shutdown_event.is_set():
+        while True:
             t0 = time.monotonic()
             ret, frame = cap.read()
 
             if not ret:
                 logger.warning("Frame grab failed — reconnecting")
                 _camera_ok = False
-                return
+                break
 
             annotated, score, motion_active = detector.process_frame(frame)
 
@@ -298,25 +320,8 @@ def _capture_loop_body():
             sleep_for  = frame_interval - elapsed
             if sleep_for > 0:
                 time.sleep(sleep_for)
-    finally:
+
         cap.release()
-
-
-def capture_loop():
-    """
-    Supervisor wrapper. Starts immediately at process startup (before Flask
-    even boots) and NEVER depends on a viewer connecting. If anything inside
-    _capture_loop_body() throws — a cv2 error, a driver hiccup, anything —
-    it's caught here, logged, and the loop restarts after a short pause
-    instead of the thread dying silently.
-    """
-    global _camera_ok
-    while not _shutdown_event.is_set():
-        try:
-            _capture_loop_body()
-        except Exception as e:
-            logger.error(f"Capture loop crashed, restarting in 3s: {e}", exc_info=True)
-            _camera_ok = False
         time.sleep(2)
 
 
@@ -456,42 +461,11 @@ def reset_background():
     return jsonify({"status": "background model reset"})
 
 
-def start_background_threads():
-    """
-    Starts the camera capture thread and WhatsApp listener exactly once.
-    Called at MODULE LOAD time (not just inside `if __name__ == "__main__"`)
-    so the camera starts immediately when the process starts, regardless of
-    whether it's launched via `python app.py` (dev) or imported by a
-    production WSGI server like gunicorn (`gunicorn app:app`). This is what
-    guarantees the camera never waits for a viewer to connect.
-    """
-    global _threads_started
-    with _threads_lock:
-        if _threads_started:
-            return
-        _threads_started = True
-
-    threading.Thread(target=capture_loop, daemon=True, name="capture").start()
-    threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
-    logger.info(f"CCTV background threads started on {socket.gethostname()} "
-                f"— alerts={'ON' if alerts_enabled() else 'OFF'}")
-
-
-def _handle_shutdown(signum, frame):
-    logger.info(f"Received signal {signum} — shutting down gracefully")
-    _shutdown_event.set()
-    # Give the capture thread a moment to release the camera cleanly
-    time.sleep(1)
-    os._exit(0)
-
-
-signal.signal(signal.SIGTERM, _handle_shutdown)
-signal.signal(signal.SIGINT, _handle_shutdown)
-
-# Start immediately on import — see docstring above for why this matters.
-start_background_threads()
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Capture thread
+    threading.Thread(target=capture_loop, daemon=True, name="capture").start()
+    # WhatsApp command listener
+    threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+    logger.info(f"CCTV starting on {socket.gethostname()} — alerts={'ON' if alerts_enabled() else 'OFF'}")
     app.run(host="0.0.0.0", port=5000, threaded=True)
