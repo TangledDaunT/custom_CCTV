@@ -38,7 +38,7 @@ MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up
 MOTION_VAR_THRESHOLD    = 16     # was 40 — MOG2 more sensitive to subtle changes
 
 # Schedule — alerts only between 11PM and 6AM
-SCHEDULE_START_HOUR = 23
+SCHEDULE_START_HOUR = 0
 SCHEDULE_END_HOUR   = 6
 
 # WhatsApp
