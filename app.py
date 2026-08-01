@@ -31,9 +31,9 @@ JPEG_QUALITY   = 80
 TARGET_FPS     = 10
 
 # Motion sensitivity — tuned high (lower = more sensitive)
-MOTION_MIN_AREA         = 3000
-MOTION_COOLDOWN_SECONDS = 60
-MOTION_FRAMES_TRIGGER   = 5     # was 3 — fires faster
+MOTION_MIN_AREA         = 8000   # only large objects (person/car sized)
+MOTION_COOLDOWN_SECONDS = 120    # max 1 alert per 2 minutes
+MOTION_FRAMES_TRIGGER   = 8      # needs 8 consecutive frames = 0.8s of solid motion  # was 3 — fires faster
 MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up
 MOTION_VAR_THRESHOLD    = 16     # was 40 — MOG2 more sensitive to subtle changes
 
