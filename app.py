@@ -47,6 +47,9 @@ VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
 FFMPEG_CRF              = os.environ.get("FFMPEG_CRF", "23")
 FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
 
+# Allow disabling object-detection filtering for testing (set to '1' to disable)
+DISABLE_OBJECT_FILTER = os.environ.get("DISABLE_OBJECT_FILTER", "0") == "1"
+
 # Auth token for control endpoints (set via env CCTV_ADMIN_TOKEN)
 ADMIN_TOKEN = os.environ.get("CCTV_ADMIN_TOKEN", "changeme-token")
 
@@ -139,6 +142,11 @@ except Exception as e:
 
 def detect_person_vehicle(frame, net, conf_thresh=0.4):
     """Return True if a person/vehicle is detected in the frame using MobileNet-SSD."""
+    # Allow an operator override to bypass object filtering during tests
+    if DISABLE_OBJECT_FILTER:
+        logger.info("DISABLE_OBJECT_FILTER=1 — bypassing object detection")
+        return True
+
     if net is None:
         return True  # no model -> allow
     try:
@@ -278,15 +286,27 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
     try:
         # Open writer to temporary AVI
         writer = cv2.VideoWriter(avi_path, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+        if not writer or not writer.isOpened():
+            logger.error(f"VideoWriter failed to open for {avi_path} — aborting recording")
+            # ensure any partial file is removed
+            try:
+                if os.path.exists(avi_path):
+                    os.remove(avi_path)
+            except Exception:
+                pass
+            return
 
         # Write prebuffer frames
         with _buffer_lock:
             pre_frames = list(_frame_buffer)
+        logger.info(f"Recording event — prebuffer frames: {len(pre_frames)} to {avi_path}")
+        frames_written = 0
         for f in pre_frames:
             try:
                 writer.write(f)
-            except Exception:
-                pass
+                frames_written += 1
+            except Exception as e:
+                logger.error(f"Error writing prebuffer frame: {e}")
 
         # Write live frames for duration
         end_time = time.time() + VIDEO_DURATION_SECONDS
@@ -294,7 +314,11 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
             with _buffer_lock:
                 f = _latest_bgr.copy() if _latest_bgr is not None else None
             if f is not None:
-                writer.write(f)
+                try:
+                    writer.write(f)
+                    frames_written += 1
+                except Exception as e:
+                    logger.error(f"Error writing live frame: {e}")
             time.sleep(1.0 / max(1, TARGET_FPS))
 
         # finalize
@@ -303,6 +327,7 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
         except Exception:
             pass
         writer = None
+        logger.info(f"Finished recording — frames_written={frames_written}; avi_exists={os.path.exists(avi_path)}")
 
         # Transcode to MP4 (H.264) using ffmpeg for good quality & size
         try:
@@ -319,7 +344,8 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
                         logger.error(f"ffmpeg stderr: {res.stderr}")
                         logger.debug(f"ffmpeg stdout: {res.stdout}")
                     else:
-                        logger.info(f"ffmpeg transcode succeeded: {mp4_path}")
+                        size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
+                        logger.info(f"ffmpeg transcode succeeded: {mp4_path} ({size} bytes)")
                 except subprocess.TimeoutExpired:
                     logger.error("ffmpeg transcode timed out")
                 except Exception as e:
