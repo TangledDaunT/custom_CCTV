@@ -9,8 +9,14 @@ import json
 import socket
 from collections import deque
 from datetime import datetime
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, send_from_directory, request
 from motion import MotionDetector
+from db import ensure_db, insert_event, list_events
+from model_utils import ensure_mobilenet, get_model_dir
+import shutil
+import tempfile
+import os.path
+import pathlib
 
 # ── Logging — rotate logs so they never fill the disk ─────────────────────────
 os.makedirs("/var/log/cctv", exist_ok=True)
@@ -37,6 +43,11 @@ VIDEO_DURATION_SECONDS   = 30
 PREBUFFER_SECONDS        = 5
 VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
 VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
+FFMPEG_CRF              = os.environ.get("FFMPEG_CRF", "23")
+FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
+
+# Auth token for control endpoints (set via env CCTV_ADMIN_TOKEN)
+ADMIN_TOKEN = os.environ.get("CCTV_ADMIN_TOKEN", "changeme-token")
 
 # Motion sensitivity — tuned high (lower = more sensitive)
 MOTION_MIN_AREA         = 8000   # only large objects (person/car sized)
@@ -112,6 +123,46 @@ detector = MotionDetector(
     blur_size=MOTION_BLUR_SIZE,
     var_threshold=MOTION_VAR_THRESHOLD,
 )
+
+# Load object detection model (MobileNet-SSD) for person/vehicle filtering
+_dnn_net = None
+try:
+    _dnn_net = ensure_mobilenet(VIDEO_DIR)
+    if _dnn_net is not None:
+        logger.info("MobileNet-SSD loaded for object filtering")
+    else:
+        logger.warning("MobileNet-SSD not available; falling back to motion-only alerts")
+except Exception as e:
+    logger.error(f"Failed to initialize object detection model: {e}")
+
+
+def detect_person_vehicle(frame, net, conf_thresh=0.4):
+    """Return True if a person/vehicle is detected in the frame using MobileNet-SSD."""
+    if net is None:
+        return True  # no model -> allow
+    try:
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+        net.setInput(blob)
+        detections = net.forward()
+        # class IDs of interest (MobileNet-SSD): person=15, car=7, bus=6, motorbike=14, train=19
+        interesting = {15, 7, 6, 14, 19}
+        h, w = frame.shape[:2]
+        for i in range(detections.shape[2]):
+            conf = float(detections[0, 0, i, 2])
+            if conf < conf_thresh:
+                continue
+            cls = int(detections[0, 0, i, 1])
+            if cls in interesting:
+                # bounding box check
+                box = detections[0, 0, i, 3:7] * [w, h, w, h]
+                (startX, startY, endX, endY) = box.astype("int")
+                area = max(0, endX - startX) * max(0, endY - startY)
+                if area >= 500:  # reasonable size
+                    return True
+        return False
+    except Exception as e:
+        logger.error(f"Object detection error: {e}")
+        return True
 
 # ── Schedule helper ───────────────────────────────────────────────────────────
 def is_within_schedule() -> bool:
@@ -199,6 +250,11 @@ def send_whatsapp_alert(snapshot_frame):
 def _ensure_video_dir():
     try:
         os.makedirs(VIDEO_DIR, exist_ok=True)
+        # ensure DB exists in video dir
+        try:
+            ensure_db(VIDEO_DIR)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Failed to create video dir {VIDEO_DIR}: {e}")
 
@@ -210,14 +266,15 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
     _ensure_video_dir()
 
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"event_{ts_str}.avi"
-    path = os.path.join(VIDEO_DIR, filename)
+    filename_base = f"event_{ts_str}"
+    avi_path = os.path.join(VIDEO_DIR, filename_base + ".avi")
+    mp4_path = os.path.join(VIDEO_DIR, filename_base + ".mp4")
 
     fourcc = cv2.VideoWriter_fourcc(*"MJPG")
     writer = None
     try:
-        # Open writer
-        writer = cv2.VideoWriter(path, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+        # Open writer to temporary AVI
+        writer = cv2.VideoWriter(avi_path, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
 
         # Write prebuffer frames
         with _buffer_lock:
@@ -228,7 +285,7 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
             except Exception:
                 pass
 
-        # Then write live frames for duration
+        # Write live frames for duration
         end_time = time.time() + VIDEO_DURATION_SECONDS
         while time.time() < end_time:
             with _buffer_lock:
@@ -237,15 +294,56 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
                 writer.write(f)
             time.sleep(1.0 / max(1, TARGET_FPS))
 
-        writer.release()
+        # finalize
+        try:
+            writer.release()
+        except Exception:
+            pass
         writer = None
 
+        # Transcode to MP4 (H.264) using ffmpeg for good quality & size
+        try:
+            if os.path.exists(avi_path):
+                cmd = [
+                    "ffmpeg", "-y", "-i", avi_path,
+                    "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", str(FFMPEG_CRF),
+                    "-pix_fmt", "yuv420p", mp4_path,
+                ]
+                subprocess.run(cmd, timeout=120, check=False, capture_output=True)
+                # remove the avi to save space
+                try:
+                    os.remove(avi_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"ffmpeg transcode failed: {e}")
+
+        # create thumbnail
+        thumb_path = None
+        try:
+            if os.path.exists(mp4_path):
+                thumb_path = os.path.join(VIDEO_DIR, filename_base + "_thumb.jpg")
+                cap = cv2.VideoCapture(mp4_path)
+                ret, f = cap.read()
+                if ret:
+                    cv2.imwrite(thumb_path, f, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                cap.release()
+        except Exception as e:
+            logger.error(f"Thumbnail creation failed: {e}")
+
+        # send via whatsapp
         caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
         for number in ALERT_NUMBERS:
-            if os.path.exists(path):
-                _wacli_send_video(number, path, caption)
+            if os.path.exists(mp4_path):
+                _wacli_send_video(number, mp4_path, caption)
             else:
                 _wacli_send_text(number, caption)
+
+        # record event in DB
+        try:
+            insert_event(VIDEO_DIR, mp4_path, thumb_path, avg_score)
+        except Exception as e:
+            logger.error(f"Failed to insert event into DB: {e}")
 
     except Exception as e:
         logger.error(f"Failed to record/send event video: {e}")
@@ -294,6 +392,27 @@ def send_whatsapp_status(message: str):
     """Send a plain status message (stop/start confirmation) to all numbers."""
     for number in ALERT_NUMBERS:
         _wacli_send_text(number, message)
+
+
+def _check_token_from_request(req):
+    # Check Authorization header or ?token= param
+    auth = req.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        return token == ADMIN_TOKEN
+    token = req.args.get("token")
+    if token:
+        return token == ADMIN_TOKEN
+    return False
+
+
+def require_admin(fn):
+    def wrapper(*args, **kwargs):
+        if not _check_token_from_request(request):
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 # ── WhatsApp command listener ─────────────────────────────────────────────────
@@ -377,9 +496,19 @@ def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
         reason = "alerts disabled" if not alerts_enabled() else "outside schedule"
         logger.info(f"Motion detected — skipping alert ({reason})")
         return
-    logger.info(f"🚨 Motion! {len(contours)} region(s) — alerting")
-    # Start recording + send video and immediate text
-    start_record_and_alert(contours, frame)
+    logger.info(f"🚨 Motion! {len(contours)} region(s) — evaluating for person/vehicle")
+
+    # Apply object filter: ignore pure noise if no person/vehicle detected
+    try:
+        ok = detect_person_vehicle(frame, _dnn_net, conf_thresh=0.4)
+        if not ok:
+            logger.info("Motion suppressed: no person/vehicle detected")
+            return
+    except Exception as e:
+        logger.error(f"Object filter failed: {e}")
+
+    logger.info("Person/vehicle detected — recording and alerting")
+    start_record_and_alert(contours, frame, avg_score)
 
 
 @detector.on_motion_end
@@ -526,6 +655,10 @@ INDEX_HTML = """<!DOCTYPE html>
     Score: <span id="s-sc">—</span>% &nbsp;|&nbsp;
     Frames: <span id="s-fr">—</span>
   </div>
+    <div id="events-list" style="width:100%;max-width:900px;margin-top:12px;color:#ccc">
+        <h3 style="font-size:.9rem;color:#9ad">Recent Events</h3>
+        <div id="events" style="display:flex;flex-wrap:wrap;gap:10px"></div>
+    </div>
 </main>
 <script>
   const dot    = document.getElementById('dot');
@@ -556,8 +689,30 @@ INDEX_HTML = """<!DOCTYPE html>
     poll();
   }
 
+    async function loadEvents(){
+        try{
+            const res = await fetch('/events');
+            const items = await res.json();
+            const container = document.getElementById('events');
+            container.innerHTML = '';
+            for(const it of items){
+                const div = document.createElement('div');
+                div.style.width='160px';div.style.textAlign='center';
+                const img = document.createElement('img');
+                img.style.width='160px'; img.style.height='90px'; img.style.objectFit='cover';
+                if(it.thumb_path){
+                    img.src = '/thumbs/' + it.thumb_path.split('/').pop();
+                } else img.src='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90"><rect width="100%" height="100%" fill="#222"/></svg>';
+                const p = document.createElement('div'); p.style.fontSize='.75rem'; p.style.color='#aaa'; p.textContent = it.ts + ' (' + Math.round(it.score*100)/100 + ')';
+                div.appendChild(img); div.appendChild(p);
+                container.appendChild(div);
+            }
+        }catch(e){ }
+    }
+
   document.getElementById('feed').onload = ()=>dot.classList.add('live');
   poll(); setInterval(poll, 2000);
+    loadEvents(); setInterval(loadEvents, 60*1000);
 </script>
 </body>
 </html>"""
@@ -587,6 +742,8 @@ def stats():
 @app.route("/alerts", methods=["POST"])
 def toggle_alerts():
     from flask import request
+    if not _check_token_from_request(request):
+        return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(force=True)
     val  = bool(data.get("enabled", True))
     set_alerts_enabled(val)
@@ -594,8 +751,30 @@ def toggle_alerts():
 
 @app.route("/reset_background", methods=["POST"])
 def reset_background():
+    if not _check_token_from_request(request):
+        return jsonify({"error": "unauthorized"}), 401
     detector.reset_background()
     return jsonify({"status": "background model reset"})
+
+
+@app.route("/events")
+def events():
+    items = list_events(VIDEO_DIR)
+    return jsonify(items)
+
+
+@app.route('/thumbs/<path:filename>')
+def thumbs(filename):
+    # serve thumbnail images from video dir
+    return send_from_directory(VIDEO_DIR, filename)
+
+
+@app.route('/videos/<path:filename>')
+def get_video(filename):
+    # protected access to raw video files
+    if not _check_token_from_request(request):
+        return jsonify({"error": "unauthorized"}), 401
+    return send_from_directory(VIDEO_DIR, filename)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

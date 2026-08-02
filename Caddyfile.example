@@ -1,0 +1,6 @@
+shreyanshhcctv.dpdns.org {
+    reverse_proxy localhost:5000
+    tls you@your.email
+    # Optional: enable basic auth for the site
+    # basicauth / user JDJhJDEyJHNhbXBsZS1oYXNoZWQtcGFzcw==
+}
