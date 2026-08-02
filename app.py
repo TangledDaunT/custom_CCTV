@@ -38,7 +38,8 @@ JPEG_QUALITY   = 80
 TARGET_FPS     = 10
 
 # Video recording for alerts
-VIDEO_DIR                = "/mnt/disk2/cctv_videos"  # override with actual second-disk path if needed
+# Use the attached disk where OS isn't installed: /mnt/cctv-recordings
+VIDEO_DIR                = "/mnt/cctv-recordings/cctv_videos"  # override with env VIDEO_DIR if needed
 VIDEO_DURATION_SECONDS   = 30
 PREBUFFER_SECONDS        = 5
 VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
