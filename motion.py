@@ -31,6 +31,9 @@ class MotionDetector:
         motion_frames_trigger=3, # Consecutive frames with motion before firing event
         history=500,             # MOG2 background history frames
         var_threshold=40,        # MOG2 variance threshold — lower = more sensitive
+        avg_score_threshold=0.01, # Average motion score threshold (fraction of frame)
+        avg_window=5,             # Number of recent scores to average for stability
+        border_ignore_px=8,       # Ignore contours touching image border within px
     ):
         self.min_area = min_area
         self.threshold = threshold
@@ -40,6 +43,9 @@ class MotionDetector:
         self.motion_frames_trigger = motion_frames_trigger
         self._history = history
         self._var_threshold = var_threshold
+        self.avg_score_threshold = avg_score_threshold
+        self.avg_window = avg_window
+        self.border_ignore_px = border_ignore_px
 
         # MOG2: best balance of speed vs accuracy for static cameras
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -108,7 +114,18 @@ class MotionDetector:
         )
 
         # --- Filter by area ---
-        significant = [c for c in contours if cv2.contourArea(c) >= self.min_area]
+        # Filter out tiny contours and those touching borders (likely noise)
+        significant = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            H, W = frame.shape[:2]
+            # ignore contours that touch frame border within tolerance
+            if x <= self.border_ignore_px or y <= self.border_ignore_px or (x + w) >= (W - self.border_ignore_px) or (y + h) >= (H - self.border_ignore_px):
+                continue
+            significant.append(c)
 
         # --- Motion score: fraction of frame covered by significant motion ---
         h, w = frame.shape[:2]
@@ -117,7 +134,10 @@ class MotionDetector:
         score = min(motion_area / frame_area, 1.0)
         self._score_history.append(score)
 
-        has_motion = len(significant) > 0
+        # Require both a significant contour and a recent averaged score above threshold
+        recent_scores = list(self._score_history)[-self.avg_window:]
+        avg_recent = (sum(recent_scores) / len(recent_scores)) if recent_scores else 0.0
+        has_motion = (len(significant) > 0) and (avg_recent >= self.avg_score_threshold)
 
         # --- Annotate frame ---
         annotated = frame.copy()
@@ -156,7 +176,8 @@ class MotionDetector:
                     self._last_event_time = now
                     self.total_events += 1
                     logger.info(f"Motion START (event #{self.total_events})")
-                    self._fire(self._on_motion_start, now, significant, annotated)
+                    # pass avg_recent in case callers want the score
+                    self._fire(self._on_motion_start, now, significant, annotated, avg_recent)
 
             else:
                 self._motion_frame_count = 0

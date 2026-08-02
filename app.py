@@ -7,6 +7,7 @@ import subprocess
 import os
 import json
 import socket
+from collections import deque
 from datetime import datetime
 from flask import Flask, Response, jsonify, render_template_string
 from motion import MotionDetector
@@ -29,6 +30,13 @@ FRAME_WIDTH    = 1280
 FRAME_HEIGHT   = 720
 JPEG_QUALITY   = 80
 TARGET_FPS     = 10
+
+# Video recording for alerts
+VIDEO_DIR                = "/mnt/disk2/cctv_videos"  # override with actual second-disk path if needed
+VIDEO_DURATION_SECONDS   = 30
+PREBUFFER_SECONDS        = 5
+VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
+VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
 
 # Motion sensitivity — tuned high (lower = more sensitive)
 MOTION_MIN_AREA         = 8000   # only large objects (person/car sized)
@@ -60,6 +68,9 @@ _frame_lock    = threading.Lock()
 _latest_frame  = None
 _camera_ok     = False
 _snapshot_lock = threading.Lock()
+_frame_buffer  = deque(maxlen=TARGET_FPS * PREBUFFER_SECONDS)
+_latest_bgr    = None
+_buffer_lock   = threading.Lock()
 
 # Alerts enabled flag — load from state file on startup
 def _load_alert_state():
@@ -145,8 +156,29 @@ def _wacli_send_file(number: str, path: str, caption: str):
         logger.error(f"❌ wacli file exception {number}: {e}")
 
 
+def _wacli_send_video(number: str, path: str, caption: str):
+    """Send a video file via wacli; fall back to text on failure."""
+    try:
+        result = subprocess.run(
+            [WACLI_PATH, "send", "file", "--to", number, "--file", path, "--caption", caption],
+            timeout=40, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ Video sent to {number}")
+        else:
+            logger.warning(f"⚠ Video send failed {number}, falling back to text: {result.stderr.strip()}")
+            _wacli_send_text(number, caption)
+    except subprocess.TimeoutExpired:
+        logger.error(f"⏱ wacli video timeout {number}")
+        _wacli_send_text(number, caption)
+    except Exception as e:
+        logger.error(f"❌ wacli video exception {number}: {e}")
+        _wacli_send_text(number, caption)
+
+
 def send_whatsapp_alert(snapshot_frame):
-    ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # legacy single-frame alert kept for compatibility
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     message = f"🚨 Motion detected at {ts}"
 
     snapshot_saved = False
@@ -162,6 +194,100 @@ def send_whatsapp_alert(snapshot_frame):
             _wacli_send_file(number, SNAPSHOT_PATH, message)
         else:
             _wacli_send_text(number, message)
+
+
+def _ensure_video_dir():
+    try:
+        os.makedirs(VIDEO_DIR, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create video dir {VIDEO_DIR}: {e}")
+
+
+def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
+    """Record a short video covering the event: include PREBUFFER then live frames for VIDEO_DURATION_SECONDS.
+    After recording, send the video via WhatsApp to all recipients.
+    """
+    _ensure_video_dir()
+
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"event_{ts_str}.avi"
+    path = os.path.join(VIDEO_DIR, filename)
+
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    writer = None
+    try:
+        # Open writer
+        writer = cv2.VideoWriter(path, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+
+        # Write prebuffer frames
+        with _buffer_lock:
+            pre_frames = list(_frame_buffer)
+        for f in pre_frames:
+            try:
+                writer.write(f)
+            except Exception:
+                pass
+
+        # Then write live frames for duration
+        end_time = time.time() + VIDEO_DURATION_SECONDS
+        while time.time() < end_time:
+            with _buffer_lock:
+                f = _latest_bgr.copy() if _latest_bgr is not None else None
+            if f is not None:
+                writer.write(f)
+            time.sleep(1.0 / max(1, TARGET_FPS))
+
+        writer.release()
+        writer = None
+
+        caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
+        for number in ALERT_NUMBERS:
+            if os.path.exists(path):
+                _wacli_send_video(number, path, caption)
+            else:
+                _wacli_send_text(number, caption)
+
+    except Exception as e:
+        logger.error(f"Failed to record/send event video: {e}")
+    finally:
+        try:
+            if writer is not None:
+                writer.release()
+        except Exception:
+            pass
+
+
+def start_record_and_alert(contours, frame, avg_score=0.0):
+    # Immediate status message
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"🚨 Motion detected at {ts} — recording {VIDEO_DURATION_SECONDS}s video"
+    for n in ALERT_NUMBERS:
+        _wacli_send_text(n, msg)
+
+    # Spawn recording thread to create and send video
+    t = threading.Thread(target=_record_event_and_send, args=(time.time(), contours, frame, avg_score), daemon=True)
+    t.start()
+
+
+def _video_cleanup_loop():
+    _ensure_video_dir()
+    while True:
+        try:
+            now = time.time()
+            for fn in os.listdir(VIDEO_DIR):
+                path = os.path.join(VIDEO_DIR, fn)
+                try:
+                    if not os.path.isfile(path):
+                        continue
+                    mtime = os.path.getmtime(path)
+                    if (now - mtime) > VIDEO_MAX_AGE_SECONDS:
+                        os.remove(path)
+                        logger.info(f"Deleted old video: {path}")
+                except Exception as e:
+                    logger.error(f"Cleanup error for {path}: {e}")
+        except Exception as e:
+            logger.error(f"Video cleanup loop error: {e}")
+        time.sleep(VIDEO_CLEANUP_SECONDS)
 
 
 def send_whatsapp_status(message: str):
@@ -246,13 +372,14 @@ def whatsapp_command_listener():
 
 # ── Motion callbacks ──────────────────────────────────────────────────────────
 @detector.on_motion_start
-def handle_motion_start(timestamp, contours, frame):
+def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
     if not alerts_should_fire():
         reason = "alerts disabled" if not alerts_enabled() else "outside schedule"
         logger.info(f"Motion detected — skipping alert ({reason})")
         return
     logger.info(f"🚨 Motion! {len(contours)} region(s) — alerting")
-    send_whatsapp_alert(frame)
+    # Start recording + send video and immediate text
+    start_record_and_alert(contours, frame)
 
 
 @detector.on_motion_end
@@ -315,6 +442,16 @@ def capture_loop():
             if ok:
                 with _frame_lock:
                     _latest_frame = buf.tobytes()
+
+                # keep raw annotated BGR frame in buffer for video recording
+                try:
+                    with _buffer_lock:
+                        _frame_buffer.append(annotated.copy())
+                        # also update latest bgr for recorder
+                        global _latest_bgr
+                        _latest_bgr = annotated.copy()
+                except Exception:
+                    pass
 
             elapsed    = time.monotonic() - t0
             sleep_for  = frame_interval - elapsed
@@ -467,5 +604,7 @@ if __name__ == "__main__":
     threading.Thread(target=capture_loop, daemon=True, name="capture").start()
     # WhatsApp command listener
     threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+    # Video cleanup thread
+    threading.Thread(target=_video_cleanup_loop, daemon=True, name="video-cleanup").start()
     logger.info(f"CCTV starting on {socket.gethostname()} — alerts={'ON' if alerts_enabled() else 'OFF'}")
     app.run(host="0.0.0.0", port=5000, threaded=True)
