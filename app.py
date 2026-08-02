@@ -218,7 +218,9 @@ def _wacli_send_video(number: str, path: str, caption: str):
         if result.returncode == 0:
             logger.info(f"✅ Video sent to {number}")
         else:
-            logger.warning(f"⚠ Video send failed {number}, falling back to text: {result.stderr.strip()}")
+            logger.warning(f"⚠ Video send failed {number} (rc={result.returncode})")
+            logger.debug(f"wacli stderr: {result.stderr}")
+            logger.debug(f"wacli stdout: {result.stdout}")
             _wacli_send_text(number, caption)
     except subprocess.TimeoutExpired:
         logger.error(f"⏱ wacli video timeout {number}")
@@ -310,7 +312,18 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
                     "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", str(FFMPEG_CRF),
                     "-pix_fmt", "yuv420p", mp4_path,
                 ]
-                subprocess.run(cmd, timeout=120, check=False, capture_output=True)
+                try:
+                    res = subprocess.run(cmd, timeout=120, check=False, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        logger.error(f"ffmpeg failed rc={res.returncode}")
+                        logger.error(f"ffmpeg stderr: {res.stderr}")
+                        logger.debug(f"ffmpeg stdout: {res.stdout}")
+                    else:
+                        logger.info(f"ffmpeg transcode succeeded: {mp4_path}")
+                except subprocess.TimeoutExpired:
+                    logger.error("ffmpeg transcode timed out")
+                except Exception as e:
+                    logger.error(f"ffmpeg transcode exception: {e}")
                 # remove the avi to save space
                 try:
                     os.remove(avi_path)
