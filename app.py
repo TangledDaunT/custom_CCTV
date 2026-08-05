@@ -954,13 +954,181 @@ def reset_background():
 @app.route("/events")
 @require_login
 def events():
-    items = list_events(VIDEO_DIR, request.args.get("limit", 30, type=int), request.args.get("offset", 0, type=int))
+    # support filters: camera, label, flagged, since_ts, limit, offset
+    limit = request.args.get("limit", 30, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    filters = {}
+    camera = request.args.get("camera")
+    if camera:
+        filters['camera'] = camera
+    label = request.args.get("label")
+    if label:
+        filters['label'] = label
+    if request.args.get("flagged") is not None:
+        val = request.args.get("flagged")
+        filters['flagged'] = val.lower() in ("1", "true", "yes") if isinstance(val, str) else bool(val)
+    since_ts = request.args.get("since_ts")
+    if since_ts:
+        filters['since_ts'] = since_ts
+
+    items = list_events(VIDEO_DIR, limit, offset, filters)
     for item in items:
-        item["thumbnail_url"] = url_for("event_thumbnail", event_id=item["id"]) if item["thumb_path"] else None
-        item["video_url"] = url_for("event_video", event_id=item["id"])
+        item["thumbnail_url"] = url_for("event_thumbnail", event_id=item["id"]) if item.get("thumb_path") else None
+        item["video_url"] = url_for("event_video", event_id=item["id"]) 
         item.pop("video_path", None)
         item.pop("thumb_path", None)
     return jsonify(items)
+
+
+# Flag an event (mark important)
+@app.route('/events/<int:event_id>/flag', methods=['POST'])
+@require_role('operator')
+def event_flag(event_id):
+    require_csrf()
+    data = request.get_json(force=True)
+    flagged = bool(data.get('flagged', True))
+    try:
+        flag_event(VIDEO_DIR, event_id, flagged)
+        audit(VIDEO_DIR, _current_user()["username"], "event_flag", f"{event_id}={flagged}")
+        return jsonify({'ok': True, 'flagged': flagged})
+    except Exception as e:
+        logger.error(f"Flag event error: {e}")
+        return jsonify({'error': 'failed to flag event'}), 500
+
+
+# Basic sharing: generate short signed token (no DB) valid for TTL seconds
+def _make_share_token(event_id: int, ttl_seconds: int = 3600) -> str:
+    if not SECRET_KEY:
+        raise RuntimeError('SECRET_KEY required for share tokens')
+    payload = f"{event_id}:{int(time.time()) + int(ttl_seconds)}"
+    sig = hmac.new(SECRET_KEY.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}:{sig}".encode('utf-8')).decode('utf-8')
+    return token
+
+
+def _verify_share_token(token: str):
+    try:
+        raw = base64.urlsafe_b64decode(token.encode('utf-8')).decode('utf-8')
+        parts = raw.split(":")
+        if len(parts) < 3:
+            return None
+        event_id = int(parts[0])
+        exp = int(parts[1])
+        sig = parts[2]
+        if time.time() > exp:
+            return None
+        payload = f"{event_id}:{exp}"
+        expected = hmac.new(SECRET_KEY.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        return event_id
+    except Exception:
+        return None
+
+
+@app.route('/events/<int:event_id>/share', methods=['POST'])
+@require_role('operator')
+def event_share(event_id):
+    require_csrf()
+    data = request.get_json(force=True)
+    ttl = int(data.get('ttl', 3600))
+    try:
+        token = _make_share_token(event_id, ttl)
+        share_url = url_for('shared_video', token=token, _external=True)
+        audit(VIDEO_DIR, _current_user()["username"], "event_share", f"{event_id} ttl={ttl}")
+        return jsonify({'share_url': share_url, 'expires_in': ttl})
+    except Exception as e:
+        logger.error(f"Share token error: {e}")
+        return jsonify({'error': 'failed to create share token'}), 500
+
+
+@app.route('/shared/<token>')
+def shared_video(token):
+    event_id = _verify_share_token(token)
+    if not event_id:
+        abort(404)
+    media = _event_media(event_id, 'video_path')
+    return send_file(media, conditional=True)
+
+
+# Sensitivity/settings endpoint
+@app.route('/settings/sensitivity', methods=['POST'])
+@require_role('operator')
+def set_sensitivity():
+    require_csrf()
+    data = request.get_json(force=True)
+    changed = []
+    try:
+        if 'min_area' in data:
+            detector.min_area = int(data['min_area'])
+            changed.append('min_area')
+        if 'blur_size' in data:
+            bs = int(data['blur_size'])
+            if bs % 2 == 0: bs += 1
+            detector.blur_size = bs
+            changed.append('blur_size')
+        if 'var_threshold' in data:
+            detector._var_threshold = int(data['var_threshold'])
+            # re-create bg_subtractor to pick up new varThreshold
+            detector.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=detector._history, varThreshold=detector._var_threshold, detectShadows=False)
+            changed.append('var_threshold')
+        if 'motion_frames_trigger' in data:
+            detector.motion_frames_trigger = int(data['motion_frames_trigger'])
+            changed.append('motion_frames_trigger')
+        audit(VIDEO_DIR, _current_user()["username"], 'sensitivity_update', ','.join(changed))
+        return jsonify({'ok': True, 'changed': changed})
+    except Exception as e:
+        logger.error(f"Sensitivity update failed: {e}")
+        return jsonify({'error': 'failed to update settings'}), 500
+
+
+# Snapshot endpoint: save a quick JPEG and return a URL
+@app.route('/snapshot', methods=['POST'])
+@require_role('operator')
+def snapshot():
+    require_csrf()
+    _ensure_video_dir()
+    with _snapshot_lock:
+        frame = _latest_bgr.copy() if _latest_bgr is not None else None
+    if frame is None:
+        return jsonify({'error': 'no frame available'}), 503
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    fname = f'snapshot_{ts}.jpg'
+    path = os.path.join(VIDEO_DIR, fname)
+    try:
+        cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        audit(VIDEO_DIR, _current_user()["username"], 'snapshot_taken', fname)
+        return jsonify({'url': url_for('snapshot_image', filename=fname, _external=False)})
+    except Exception as e:
+        logger.error(f"Snapshot save failed: {e}")
+        return jsonify({'error': 'failed to save snapshot'}), 500
+
+
+@app.route('/snapshot_image/<path:filename>')
+@require_login
+def snapshot_image(filename):
+    return send_from_directory(VIDEO_DIR, filename, conditional=True)
+
+
+# Notification preferences
+@app.route('/notification_prefs', methods=['GET','POST'])
+@require_role('operator')
+def notification_prefs():
+    if request.method == 'GET':
+        prefs = get_notification_prefs(VIDEO_DIR)
+        return jsonify(prefs)
+    else:
+        require_csrf()
+        data = request.get_json(force=True)
+        # expect {recipient: bool}
+        try:
+            for recip, val in (data.items() if isinstance(data, dict) else []):
+                set_notification_pref(VIDEO_DIR, recip, bool(val))
+            audit(VIDEO_DIR, _current_user()["username"], 'notification_prefs_update', json.dumps(data))
+            return jsonify({'ok': True})
+        except Exception as e:
+            logger.error(f"Notification prefs update failed: {e}")
+            return jsonify({'error': 'failed to update prefs'}), 500
 
 
 def _event_media(event_id, field):
