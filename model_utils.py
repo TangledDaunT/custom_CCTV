@@ -1,5 +1,4 @@
 import os
-import urllib.request
 import logging
 import cv2
 
@@ -10,9 +9,6 @@ MODEL_DIR_ENV = "MODEL_DIR"
 MOBILENET_PROTOTXT = "MobileNetSSD_deploy.prototxt"
 MOBILENET_CAFFEMODEL = "MobileNetSSD_deploy.caffemodel"
 
-PROTO_URL = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt"
-MODEL_URL = "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel"
-
 def get_model_dir(default_dir):
     return os.environ.get(MODEL_DIR_ENV, os.path.join(default_dir, "models"))
 
@@ -22,19 +18,12 @@ def ensure_mobilenet(default_dir):
     proto = os.path.join(d, MOBILENET_PROTOTXT)
     model = os.path.join(d, MOBILENET_CAFFEMODEL)
 
-    if not os.path.exists(proto):
-        try:
-            logger.info(f"Downloading prototxt to {proto}")
-            urllib.request.urlretrieve(PROTO_URL, proto)
-        except Exception as e:
-            logger.error("Failed to download prototxt: %s", e)
-
-    if not os.path.exists(model):
-        try:
-            logger.info(f"Downloading caffemodel to {model}")
-            urllib.request.urlretrieve(MODEL_URL, model)
-        except Exception as e:
-            logger.error("Failed to download caffemodel: %s", e)
+    # Production startup must be deterministic: do not download executable
+    # model artifacts from the network. Provision and checksum-pin them during
+    # installation, or run safely in motion-only mode.
+    if not (os.path.exists(proto) and os.path.exists(model)):
+        logger.warning("MobileNet-SSD files are not provisioned in %s; using motion-only alerts", d)
+        return None
 
     # load net if available
     net = None
