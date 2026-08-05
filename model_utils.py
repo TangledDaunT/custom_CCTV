@@ -20,9 +20,9 @@ def ensure_mobilenet(default_dir):
 
     # Production startup must be deterministic: do not download executable
     # model artifacts from the network. Provision and checksum-pin them during
-    # installation, or run safely in motion-only mode.
+    # installation. The caller fails closed and sends no alerts without it.
     if not (os.path.exists(proto) and os.path.exists(model)):
-        logger.warning("MobileNet-SSD files are not provisioned in %s; using motion-only alerts", d)
+        logger.warning("MobileNet-SSD files are not provisioned in %s; alerts will remain suppressed", d)
         return None
 
     # load net if available

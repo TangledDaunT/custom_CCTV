@@ -54,6 +54,9 @@ class SecurityBoundaryTests(unittest.TestCase):
             200,
         )
 
+    def test_unavailable_object_model_never_confirms_motion(self):
+        self.assertEqual(app.detect_person_vehicle(None, None), [])
+
 
 if __name__ == "__main__":
     unittest.main()

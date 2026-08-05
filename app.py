@@ -53,8 +53,14 @@ VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
 FFMPEG_CRF              = os.environ.get("FFMPEG_CRF", "23")
 FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
 
-# Allow disabling object-detection filtering for testing (set to '1' to disable)
-DISABLE_OBJECT_FILTER = os.environ.get("DISABLE_OBJECT_FILTER", "0") == "1"
+# A motion contour is only a candidate; alerts require a confirmed object over
+# several frames. These defaults favour precision over alert volume.
+PERSON_CONFIDENCE = float(os.environ.get("CCTV_PERSON_CONFIDENCE", "0.70"))
+VEHICLE_CONFIDENCE = float(os.environ.get("CCTV_VEHICLE_CONFIDENCE", "0.80"))
+VERIFY_SAMPLES = int(os.environ.get("CCTV_VERIFY_SAMPLES", "6"))
+VERIFY_REQUIRED = int(os.environ.get("CCTV_VERIFY_REQUIRED", "4"))
+VERIFY_INTERVAL_SECONDS = float(os.environ.get("CCTV_VERIFY_INTERVAL_SECONDS", "0.20"))
+VERIFY_MIN_MOVEMENT_PX = int(os.environ.get("CCTV_VERIFY_MIN_MOVEMENT_PX", "12"))
 
 # Browser authentication uses signed server sessions. It must be set in the
 # root-owned production environment file; there is deliberately no fallback.
@@ -151,43 +157,70 @@ try:
     if _dnn_net is not None:
         logger.info("MobileNet-SSD loaded for object filtering")
     else:
-        logger.warning("MobileNet-SSD not available; falling back to motion-only alerts")
+        logger.error("MobileNet-SSD not available; alerts are fail-closed until the model is provisioned")
 except Exception as e:
     logger.error(f"Failed to initialize object detection model: {e}")
 
 
-def detect_person_vehicle(frame, net, conf_thresh=0.4):
-    """Return True if a person/vehicle is detected in the frame using MobileNet-SSD."""
-    # Allow an operator override to bypass object filtering during tests
-    if DISABLE_OBJECT_FILTER:
-        logger.info("DISABLE_OBJECT_FILTER=1 — bypassing object detection")
-        return True
-
+def detect_person_vehicle(frame, net):
+    """Return high-confidence person/vehicle detections; never trust raw motion."""
     if net is None:
-        return True  # no model -> allow
+        return []
     try:
         blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
         net.setInput(blob)
         detections = net.forward()
-        # class IDs of interest (MobileNet-SSD): person=15, car=7, bus=6, motorbike=14, train=19
-        interesting = {15, 7, 6, 14, 19}
+        # MobileNet-SSD classes. Higher vehicle threshold prevents static
+        # motorcycles, gates and reflections being promoted to alerts.
+        classes = {15: ("person", PERSON_CONFIDENCE), 7: ("car", VEHICLE_CONFIDENCE),
+                   6: ("bus", VEHICLE_CONFIDENCE), 14: ("motorcycle", VEHICLE_CONFIDENCE),
+                   19: ("train", VEHICLE_CONFIDENCE)}
         h, w = frame.shape[:2]
+        confirmed = []
         for i in range(detections.shape[2]):
             conf = float(detections[0, 0, i, 2])
-            if conf < conf_thresh:
-                continue
             cls = int(detections[0, 0, i, 1])
-            if cls in interesting:
-                # bounding box check
-                box = detections[0, 0, i, 3:7] * [w, h, w, h]
-                (startX, startY, endX, endY) = box.astype("int")
-                area = max(0, endX - startX) * max(0, endY - startY)
-                if area >= 500:  # reasonable size
-                    return True
-        return False
+            if cls not in classes or conf < classes[cls][1]:
+                continue
+            box = detections[0, 0, i, 3:7] * [w, h, w, h]
+            start_x, start_y, end_x, end_y = box.astype("int")
+            area = max(0, end_x - start_x) * max(0, end_y - start_y)
+            if area >= 500:
+                confirmed.append({"label": classes[cls][0], "confidence": conf,
+                                  "box": (start_x, start_y, end_x, end_y)})
+        return confirmed
     except Exception as e:
         logger.error(f"Object detection error: {e}")
-        return True
+        return []
+
+
+def verify_moving_object(initial_frame):
+    """Require the same high-confidence object to persist and actually move."""
+    detections_by_label = {}
+    for sample_index in range(VERIFY_SAMPLES):
+        if sample_index:
+            time.sleep(VERIFY_INTERVAL_SECONDS)
+            with _buffer_lock:
+                frame = _latest_bgr.copy() if _latest_bgr is not None else None
+        else:
+            frame = initial_frame.copy()
+        if frame is None:
+            continue
+        for detection in detect_person_vehicle(frame, _dnn_net):
+            detections_by_label.setdefault(detection["label"], []).append(detection)
+
+    for label, detections in detections_by_label.items():
+        if len(detections) < VERIFY_REQUIRED:
+            continue
+        centers = [((d["box"][0] + d["box"][2]) / 2, (d["box"][1] + d["box"][3]) / 2) for d in detections]
+        first_x, first_y = centers[0]
+        movement = max(((x - first_x) ** 2 + (y - first_y) ** 2) ** 0.5 for x, y in centers)
+        if movement >= VERIFY_MIN_MOVEMENT_PX:
+            best = max(detections, key=lambda item: item["confidence"])
+            best["movement_px"] = round(movement, 1)
+            return best
+        logger.info("Motion suppressed: %s was static across verification frames", label)
+    return None
 
 # ── Schedule helper ───────────────────────────────────────────────────────────
 def is_within_schedule() -> bool:
@@ -599,18 +632,16 @@ def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
         reason = "alerts disabled" if not alerts_enabled() else "outside schedule"
         logger.info(f"Motion detected — skipping alert ({reason})")
         return
-    logger.info(f"🚨 Motion! {len(contours)} region(s) — evaluating for person/vehicle")
-
-    # Apply object filter: ignore pure noise if no person/vehicle detected
-    try:
-        ok = detect_person_vehicle(frame, _dnn_net, conf_thresh=0.4)
-        if not ok:
-            logger.info("Motion suppressed: no person/vehicle detected")
-            return
-    except Exception as e:
-        logger.error(f"Object filter failed: {e}")
-
-    logger.info("Person/vehicle detected — recording and alerting")
+    logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
+    if _dnn_net is None:
+        logger.error("Motion suppressed: object model unavailable (fail-closed)")
+        return
+    verified = verify_moving_object(frame)
+    if not verified:
+        logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
+        return
+    logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
+                verified["label"], verified["confidence"] * 100, verified["movement_px"])
     start_record_and_alert(contours, frame, avg_score)
 
 
