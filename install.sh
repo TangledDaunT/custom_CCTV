@@ -36,7 +36,11 @@ chown "$RUN_AS_USER":"$RUN_AS_USER" /var/lib/cctv
 # require an operator to set strong values before the first service start.
 mkdir -p /etc/cctv
 if [ ! -f /etc/cctv/cctv.env ]; then
-    cp "$REPO_DIR/cctv.env.example" /etc/cctv/cctv.env
+    if [ -f "$REPO_DIR/cctv.env" ]; then
+        cp "$REPO_DIR/cctv.env" /etc/cctv/cctv.env
+    else
+        cp "$REPO_DIR/cctv.env.example" /etc/cctv/cctv.env
+    fi
     chmod 600 /etc/cctv/cctv.env
     echo "==> Created /etc/cctv/cctv.env. Set CCTV_SECRET_KEY and CCTV_BOOTSTRAP_PASSWORD, then run install.sh again."
     exit 1

@@ -124,12 +124,14 @@ def user_count(default_dir: str) -> int:
         conn.close()
 
 
-def create_user(default_dir: str, username: str, password: str, role: str = "admin"):
+def create_user(default_dir: str, username: str, password: str, role: str = "admin", allow_weak_password: bool = False):
     username = username.strip()
     if not username or len(username) > 64:
         raise ValueError("Username must be between 1 and 64 characters.")
-    if len(password) < 12:
+    if len(password) < 12 and not allow_weak_password:
         raise ValueError("Password must be at least 12 characters.")
+    if len(password) < 5:
+        raise ValueError("Password must be at least 5 characters.")
     if role not in {"viewer", "operator", "admin"}:
         raise ValueError("Invalid role.")
     conn = _connection(default_dir)

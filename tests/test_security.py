@@ -9,6 +9,7 @@ import unittest
 TEST_ROOT = tempfile.mkdtemp(prefix="cctv-tests-")
 os.environ.update(
     CCTV_SECRET_KEY="a" * 64,
+    CCTV_BOOTSTRAP_USERNAME="admin",
     CCTV_BOOTSTRAP_PASSWORD="test-password-123",
     CCTV_COOKIE_SECURE="0",
     VIDEO_DIR=os.path.join(TEST_ROOT, "media"),

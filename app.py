@@ -501,7 +501,7 @@ def initialize_security():
     if user_count(VIDEO_DIR) == 0:
         if not BOOTSTRAP_PASSWORD:
             raise RuntimeError("No users exist. Set CCTV_BOOTSTRAP_PASSWORD for the initial admin account.")
-        create_user(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD, "admin")
+        create_user(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD, "admin", allow_weak_password=True)
         audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "bootstrap_admin_created")
         logger.info("Initial CCTV admin account created")
 
