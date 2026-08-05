@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · CCTV</title><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body class="auth-page">
+  <main class="auth-card" aria-labelledby="title">
+    <div class="brand-mark" aria-hidden="true">◉</div>
+    <p class="eyebrow">PRIVATE SECURITY</p><h1 id="title">CCTV Control</h1>
+    <p class="muted">Sign in to view your protected cameras.</p>
+    {% if error %}<div class="form-error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" class="login-form">
+      <label>Username<input name="username" autocomplete="username" required autofocus maxlength="64"></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="button primary" type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>
