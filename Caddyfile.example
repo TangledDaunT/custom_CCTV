@@ -1,6 +1,12 @@
-shreyanshhcctv.dpdns.org {
-    reverse_proxy localhost:5000
-    tls you@your.email
-    # Optional: enable basic auth for the site
-    # basicauth / user JDJhJDEyJHNhbXBsZS1oYXNoZWQtcGFzcw==
+# Replace this hostname. The CCTV application provides its own user login.
+your-cctv.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:5000
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
 }
