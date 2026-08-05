@@ -38,13 +38,17 @@ def ensure_db(default_dir: str) -> str:
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+            -- events: added flagged, camera and label to support filtering and multi-camera
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
                 video_path TEXT NOT NULL,
                 thumb_path TEXT,
                 score REAL NOT NULL DEFAULT 0,
-                reviewed_at TEXT
+                reviewed_at TEXT,
+                flagged INTEGER NOT NULL DEFAULT 0,
+                camera TEXT DEFAULT 'cam0',
+                label TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
             CREATE TABLE IF NOT EXISTS users (
@@ -62,6 +66,21 @@ def ensure_db(default_dir: str) -> str:
                 username TEXT,
                 action TEXT NOT NULL,
                 detail TEXT
+            );
+            -- notifications table (basic notification center/log)
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                sent_to TEXT,
+                status TEXT,
+                FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+            );
+            -- notification preferences (per-recipient basic toggles)
+            CREATE TABLE IF NOT EXISTS notification_prefs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1
             );
             """
         )
@@ -90,16 +109,40 @@ def insert_event(default_dir: str, video_path: str, thumb_path: Optional[str] = 
         conn.close()
 
 
-def list_events(default_dir: str, limit: int = 50, offset: int = 0):
+def list_events(default_dir: str, limit: int = 50, offset: int = 0, filters: dict = None):
+    """List events with optional filters.
+
+    Supported filters keys:
+      - camera: str
+      - label: str ('person' or 'car' etc)
+      - flagged: bool
+      - since_ts: ISO string
+    """
     if not os.path.exists(get_db_path(default_dir)):
         return []
     conn = _connection(default_dir)
     try:
-        rows = conn.execute(
-            "SELECT id, ts, video_path, thumb_path, score, reviewed_at "
-            "FROM events ORDER BY id DESC LIMIT ? OFFSET ?",
-            (min(max(int(limit), 1), 100), max(int(offset), 0)),
-        ).fetchall()
+        query = "SELECT id, ts, video_path, thumb_path, score, reviewed_at, flagged, camera, label FROM events"
+        params = []
+        where = []
+        if filters:
+            if 'camera' in filters and filters['camera']:
+                where.append("camera = ?")
+                params.append(filters['camera'])
+            if 'label' in filters and filters['label']:
+                where.append("label = ?")
+                params.append(filters['label'])
+            if 'flagged' in filters:
+                where.append("flagged = ?")
+                params.append(1 if filters['flagged'] else 0)
+            if 'since_ts' in filters and filters['since_ts']:
+                where.append("ts >= ?")
+                params.append(filters['since_ts'])
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+        params.extend([min(max(int(limit), 1), 100), max(int(offset), 0)])
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
     finally:
         conn.close()
@@ -109,9 +152,50 @@ def event_by_id(default_dir: str, event_id: int):
     conn = _connection(default_dir)
     try:
         row = conn.execute(
-            "SELECT id, ts, video_path, thumb_path, score, reviewed_at FROM events WHERE id = ?", (event_id,)
+            "SELECT id, ts, video_path, thumb_path, score, reviewed_at, flagged, camera, label FROM events WHERE id = ?", (event_id,)
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def flag_event(default_dir: str, event_id: int, flagged: bool = True):
+    conn = _connection(default_dir)
+    try:
+        conn.execute("UPDATE events SET flagged = ? WHERE id = ?", (1 if flagged else 0, event_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_notification(default_dir: str, event_id: int, sent_to: str, status: str = 'sent'):
+    conn = _connection(default_dir)
+    try:
+        conn.execute("INSERT INTO notifications (event_id, ts, sent_to, status) VALUES (?, ?, ?, ?)", (event_id, _now(), sent_to, status))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_notification_pref(default_dir: str, recipient: str, enabled: bool = True):
+    conn = _connection(default_dir)
+    try:
+        cur = conn.execute("SELECT id FROM notification_prefs WHERE recipient = ?", (recipient,))
+        row = cur.fetchone()
+        if row:
+            conn.execute("UPDATE notification_prefs SET enabled = ? WHERE recipient = ?", (1 if enabled else 0, recipient))
+        else:
+            conn.execute("INSERT INTO notification_prefs (recipient, enabled) VALUES (?, ?)", (recipient, 1 if enabled else 0))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_notification_prefs(default_dir: str):
+    conn = _connection(default_dir)
+    try:
+        rows = conn.execute("SELECT recipient, enabled FROM notification_prefs").fetchall()
+        return {row['recipient']: bool(row['enabled']) for row in rows}
     finally:
         conn.close()
 

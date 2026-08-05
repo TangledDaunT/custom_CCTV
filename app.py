@@ -11,12 +11,28 @@ from collections import deque
 from datetime import datetime
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, session, url_for
 from motion import MotionDetector
-from db import audit, authenticate_user, ensure_db, event_by_id, insert_event, list_events, provision_single_admin
+from db import (
+    audit,
+    authenticate_user,
+    ensure_db,
+    event_by_id,
+    insert_event,
+    list_events,
+    provision_single_admin,
+    flag_event,
+    insert_notification,
+    set_notification_pref,
+    get_notification_prefs,
+)
 from model_utils import ensure_mobilenet
 import tempfile
 import os.path
 import functools
 import secrets
+import hmac
+import hashlib
+import base64
+from flask import send_from_directory
 
 # ── Logging — rotate logs so they never fill the disk ─────────────────────────
 LOG_DIR = os.environ.get("CCTV_LOG_DIR", "/var/log/cctv")
