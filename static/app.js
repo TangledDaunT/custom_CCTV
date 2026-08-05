@@ -22,17 +22,52 @@ async function pollStats(){ try { updateStats(await (await api('/stats')).json()
 function formatTime(ts){ return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(ts)); }
 async function loadEvents(){
   const root = $('events');
-  try { const events = await (await api('/events?limit=24')).json(); root.innerHTML = '';
+  // gather filters
+  const params = new URLSearchParams();
+  params.set('limit', 24);
+  const label = $('filter-label') ? $('filter-label').value : '';
+  const flagged = $('filter-flagged') ? $('filter-flagged').value : '';
+  const camera = $('filter-camera') ? $('filter-camera').value : '';
+  if (label) params.set('label', label);
+  if (flagged !== '') params.set('flagged', flagged);
+  if (camera) params.set('camera', camera);
+  try { const events = await (await api('/events?'+params.toString())).json(); root.innerHTML = '';
     if (!events.length) { root.innerHTML = '<p class="empty-state">No recorded events yet.</p>'; return; }
-    events.forEach(event => { const card = document.createElement('button'); card.className='event-card';
-      card.innerHTML = event.thumbnail_url ? `<img loading="lazy" src="${event.thumbnail_url}" alt="Event at ${formatTime(event.ts)}">` : '<span class="event-placeholder">No preview</span>';
-      const meta=document.createElement('div');meta.className='event-card-info';meta.innerHTML=`<strong>${formatTime(event.ts)}</strong><small>Motion score ${Number(event.score).toFixed(2)}</small>`;card.append(meta);
+    events.forEach(event => { const card = document.createElement('div'); card.className='event-card';
+      card.tabIndex = 0;
+      const thumb = event.thumbnail_url ? `<img loading="lazy" src="${event.thumbnail_url}" alt="Event at ${formatTime(event.ts)}">` : '<span class="event-placeholder">No preview</span>';
+      const metaHtml = `<div class="event-card-info"><strong>${formatTime(event.ts)}</strong><small>Motion score ${Number(event.score).toFixed(2)}</small></div>`;
+      // action bar
+      const actions = document.createElement('div'); actions.style.display='flex'; actions.style.justifyContent='space-between'; actions.style.padding='8px';
+      const playBtn = document.createElement('button'); playBtn.className='text-button'; playBtn.textContent='Play'; playBtn.onclick = ()=> openPlayer(event);
+      const flagBtn = document.createElement('button'); flagBtn.className='text-button'; flagBtn.textContent = event.flagged ? 'Unflag' : 'Flag'; flagBtn.onclick = async (e)=>{ e.stopPropagation(); try{ const res = await api(`/events/${event.id}/flag`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({flagged: !event.flagged})}); const j = await res.json(); event.flagged = j.flagged; flagBtn.textContent = event.flagged ? 'Unflag' : 'Flag'; toast('Flag updated'); }catch(err){ toast(err.message); }};
+      const shareBtn = document.createElement('button'); shareBtn.className='text-button'; shareBtn.textContent='Share'; shareBtn.onclick = async (e)=>{ e.stopPropagation(); try{ const res = await api(`/events/${event.id}/share`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ttl:3600})}); const j = await res.json(); navigator.clipboard && navigator.clipboard.writeText(j.share_url).catch(()=>{}); toast('Share URL copied'); }catch(err){ toast(err.message); }};
+      actions.append(playBtn); actions.append(flagBtn); actions.append(shareBtn);
+      card.innerHTML = thumb + metaHtml; card.appendChild(actions);
       card.addEventListener('click', () => openPlayer(event)); root.append(card); });
   } catch { root.innerHTML='<p class="empty-state">Could not load recordings. Try refreshing.</p>'; }
 }
 function openPlayer(event){ const dialog=$('player-dialog'), video=$('event-player'); video.src=event.video_url; $('player-caption').textContent=formatTime(event.ts); dialog.showModal(); video.play().catch(()=>{}); }
 $('player-dialog').querySelector('.close-button').onclick=()=>{const d=$('player-dialog');$('event-player').pause();$('event-player').removeAttribute('src');d.close();};
 $('refresh-events').onclick=loadEvents;
+// filters
+const applyFilters = ()=> loadEvents();
+if ($('apply-filters')) $('apply-filters').onclick = applyFilters;
+// snapshot
+if ($('snapshot')) $('snapshot').onclick = async ()=>{ try{ const res = await api('/snapshot',{method:'POST'}); const j = await res.json(); toast('Snapshot saved'); }catch(e){ toast(e.message); } };
+// sensitivity slider
+if ($('sensitivity')){
+  const s = $('sensitivity');
+  s.onchange = async ()=>{ try{ await api('/settings/sensitivity',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({min_area: parseInt(s.value)})}); toast('Sensitivity updated'); }catch(e){ toast(e.message); } };
+}
+// fullscreen
+if ($('fullscreen')) $('fullscreen').onclick = ()=>{ const el = document.querySelector('.video-frame'); if (document.fullscreenElement) document.exitFullscreen(); else el.requestFullscreen && el.requestFullscreen(); };
+// onboarding
+if ($('onboard')){
+  const shown = localStorage.getItem('cctv_onboard_shown'); if (!shown){ $('onboard').showModal(); }
+  $('dismiss-onboard').onclick = ()=>{ $('onboard').close(); localStorage.setItem('cctv_onboard_shown','1'); };
+}
+
 if (CCTV.canOperate) {
   const toggle = async (enabled) => { try { await api('/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}); toast(enabled ? 'Alerts enabled' : 'Alerts paused'); pollStats(); } catch(e) { toast(e.message); } };
   $('stop-alerts').onclick=()=>toggle(false); $('start-alerts').onclick=()=>toggle(true);
