@@ -9,19 +9,25 @@ import json
 import socket
 from collections import deque
 from datetime import datetime
-from flask import Flask, Response, jsonify, render_template_string, send_from_directory, request
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, session, url_for
 from motion import MotionDetector
-from db import ensure_db, insert_event, list_events
-from model_utils import ensure_mobilenet, get_model_dir
-import shutil
+from db import audit, authenticate_user, create_user, ensure_db, event_by_id, insert_event, list_events, user_count
+from model_utils import ensure_mobilenet
 import tempfile
 import os.path
-import pathlib
+import functools
+import secrets
 
 # ── Logging — rotate logs so they never fill the disk ─────────────────────────
-os.makedirs("/var/log/cctv", exist_ok=True)
+LOG_DIR = os.environ.get("CCTV_LOG_DIR", "/var/log/cctv")
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except PermissionError:
+    # Allows local development without weakening the production service path.
+    LOG_DIR = os.path.join(tempfile.gettempdir(), "cctv-logs")
+    os.makedirs(LOG_DIR, exist_ok=True)
 handler = logging.handlers.RotatingFileHandler(
-    "/var/log/cctv/cctv.log", maxBytes=5 * 1024 * 1024, backupCount=3
+    os.path.join(LOG_DIR, "cctv.log"), maxBytes=5 * 1024 * 1024, backupCount=3
 )
 logging.basicConfig(
     level=logging.INFO,
@@ -31,15 +37,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CAMERA_INDEX   = 0
-FRAME_WIDTH    = 1280
-FRAME_HEIGHT   = 720
-JPEG_QUALITY   = 80
-TARGET_FPS     = 10
+CAMERA_INDEX   = int(os.environ.get("CCTV_CAMERA_INDEX", "0"))
+FRAME_WIDTH    = int(os.environ.get("CCTV_FRAME_WIDTH", "1280"))
+FRAME_HEIGHT   = int(os.environ.get("CCTV_FRAME_HEIGHT", "720"))
+JPEG_QUALITY   = int(os.environ.get("CCTV_JPEG_QUALITY", "80"))
+TARGET_FPS     = int(os.environ.get("CCTV_TARGET_FPS", "10"))
 
 # Video recording for alerts
 # Use the attached disk where OS isn't installed: /mnt/cctv-recordings
-VIDEO_DIR                = "/mnt/cctv-recordings/cctv_videos"  # override with env VIDEO_DIR if needed
+VIDEO_DIR                = os.environ.get("VIDEO_DIR", "/mnt/cctv-recordings/cctv_videos")
 VIDEO_DURATION_SECONDS   = 30
 PREBUFFER_SECONDS        = 5
 VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
@@ -50,8 +56,12 @@ FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
 # Allow disabling object-detection filtering for testing (set to '1' to disable)
 DISABLE_OBJECT_FILTER = os.environ.get("DISABLE_OBJECT_FILTER", "0") == "1"
 
-# Auth token for control endpoints (set via env CCTV_ADMIN_TOKEN)
-ADMIN_TOKEN = os.environ.get("CCTV_ADMIN_TOKEN", "changeme-token")
+# Browser authentication uses signed server sessions. It must be set in the
+# root-owned production environment file; there is deliberately no fallback.
+SECRET_KEY = os.environ.get("CCTV_SECRET_KEY")
+COOKIE_SECURE = os.environ.get("CCTV_COOKIE_SECURE", "1") == "1"
+BOOTSTRAP_USERNAME = os.environ.get("CCTV_BOOTSTRAP_USERNAME", "admin")
+BOOTSTRAP_PASSWORD = os.environ.get("CCTV_BOOTSTRAP_PASSWORD")
 
 # Motion sensitivity — tuned high (lower = more sensitive)
 MOTION_MIN_AREA         = 8000   # only large objects (person/car sized)
@@ -61,22 +71,27 @@ MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up
 MOTION_VAR_THRESHOLD    = 16     # was 40 — MOG2 more sensitive to subtle changes
 
 # Schedule — alerts only between 11PM and 6AM
-SCHEDULE_START_HOUR = 0
-SCHEDULE_END_HOUR   = 6
+SCHEDULE_START_HOUR = int(os.environ.get("CCTV_SCHEDULE_START_HOUR", "23"))
+SCHEDULE_END_HOUR   = int(os.environ.get("CCTV_SCHEDULE_END_HOUR", "6"))
 
 # WhatsApp
-WACLI_PATH    = "/home/linuxbrew/.linuxbrew/bin/wacli"
-ALERT_NUMBERS = [
-    "917754008079",
-    "919415512543",
-    "917678815222",
-]
-SNAPSHOT_PATH = "/tmp/cctv_snapshot.jpg"
+WACLI_PATH    = os.environ.get("WACLI_PATH", "/home/linuxbrew/.linuxbrew/bin/wacli")
+ALERT_NUMBERS = [number.strip() for number in os.environ.get("CCTV_ALERT_NUMBERS", "").split(",") if number.strip()]
+SNAPSHOT_PATH = os.environ.get("CCTV_SNAPSHOT_PATH", "/var/lib/cctv/cctv_snapshot.jpg")
 
 # State file — persists stop/start across reboots
-STATE_FILE = "/tmp/cctv_alerts_enabled"
+STATE_FILE = os.environ.get("CCTV_STATE_FILE", "/var/lib/cctv/alerts_enabled")
 
 app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SESSION_COOKIE_NAME="cctv_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=COOKIE_SECURE,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=8 * 60 * 60,
+    MAX_CONTENT_LENGTH=64 * 1024,
+)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _frame_lock    = threading.Lock()
@@ -102,6 +117,7 @@ _alerts_enabled_lock = threading.Lock()
 
 def _save_alert_state(enabled: bool):
     try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w") as f:
             f.write("1" if enabled else "0")
     except Exception as e:
@@ -176,6 +192,10 @@ def detect_person_vehicle(frame, net, conf_thresh=0.4):
 # ── Schedule helper ───────────────────────────────────────────────────────────
 def is_within_schedule() -> bool:
     hour = datetime.now().hour
+    if SCHEDULE_START_HOUR == SCHEDULE_END_HOUR:
+        return True
+    if SCHEDULE_START_HOUR < SCHEDULE_END_HOUR:
+        return SCHEDULE_START_HOUR <= hour < SCHEDULE_END_HOUR
     return hour >= SCHEDULE_START_HOUR or hour < SCHEDULE_END_HOUR
 
 def alerts_should_fire() -> bool:
@@ -246,6 +266,7 @@ def send_whatsapp_alert(snapshot_frame):
     snapshot_saved = False
     with _snapshot_lock:
         try:
+            os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
             cv2.imwrite(SNAPSHOT_PATH, snapshot_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             snapshot_saved = True
         except Exception as e:
@@ -434,25 +455,55 @@ def send_whatsapp_status(message: str):
         _wacli_send_text(number, message)
 
 
-def _check_token_from_request(req):
-    # Check Authorization header or ?token= param
-    auth = req.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        return token == ADMIN_TOKEN
-    token = req.args.get("token")
-    if token:
-        return token == ADMIN_TOKEN
-    return False
+ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
 
 
-def require_admin(fn):
+def _current_user():
+    if not session.get("user_id"):
+        return None
+    return {"id": session["user_id"], "username": session["username"], "role": session["role"]}
+
+
+def require_login(fn):
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if not _check_token_from_request(request):
-            return jsonify({"error": "unauthorized"}), 401
+        if not _current_user():
+            return redirect(url_for("login", next=request.full_path if request.method == "GET" else None))
         return fn(*args, **kwargs)
-    wrapper.__name__ = fn.__name__
     return wrapper
+
+
+def require_role(role):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            user = _current_user()
+            if not user:
+                return jsonify({"error": "authentication required"}), 401
+            if ROLE_RANK.get(user["role"], 0) < ROLE_RANK[role]:
+                return jsonify({"error": "insufficient permissions"}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def require_csrf():
+    token = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
+    if not token or not secrets.compare_digest(token, session.get("csrf_token", "")):
+        abort(400, description="Invalid CSRF token")
+
+
+def initialize_security():
+    """Validate secrets and create the first account only from deployment config."""
+    if not SECRET_KEY or len(SECRET_KEY) < 32:
+        raise RuntimeError("CCTV_SECRET_KEY must be set to a random value of at least 32 characters")
+    _ensure_video_dir()
+    if user_count(VIDEO_DIR) == 0:
+        if not BOOTSTRAP_PASSWORD:
+            raise RuntimeError("No users exist. Set CCTV_BOOTSTRAP_PASSWORD for the initial admin account.")
+        create_user(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD, "admin")
+        audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "bootstrap_admin_created")
+        logger.info("Initial CCTV admin account created")
 
 
 # ── WhatsApp command listener ─────────────────────────────────────────────────
@@ -760,70 +811,142 @@ INDEX_HTML = """<!DOCTYPE html>
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
+@require_login
 def index():
-    return render_template_string(INDEX_HTML, hostname=socket.gethostname())
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return render_template("dashboard.html", hostname=socket.gethostname(), user=_current_user(), csrf_token=session["csrf_token"])
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if _current_user():
+        return redirect(url_for("index"))
+    error = None
+    if request.method == "POST":
+        username, password = request.form.get("username", ""), request.form.get("password", "")
+        user = authenticate_user(VIDEO_DIR, username, password)
+        if user:
+            session.clear()
+            session.update(user_id=user["id"], username=user["username"], role=user["role"], csrf_token=secrets.token_urlsafe(32))
+            session.permanent = True
+            audit(VIDEO_DIR, user["username"], "login")
+            target = request.args.get("next", "")
+            return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("index"))
+        audit(VIDEO_DIR, username.strip()[:64] or None, "login_failed")
+        error = "Invalid username or password."
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout", methods=["POST"])
+@require_login
+def logout():
+    require_csrf()
+    audit(VIDEO_DIR, _current_user()["username"], "logout")
+    session.clear()
+    return redirect(url_for("login"))
+
 
 @app.route("/video_feed")
+@require_login
 def video_feed():
     return Response(generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "camera": _camera_ok})
 
+
 @app.route("/stats")
+@require_login
 def stats():
     s = detector.get_stats()
-    s["camera_ok"]      = _camera_ok
-    s["alerts_enabled"] = alerts_enabled()
-    s["schedule_active"] = is_within_schedule()
+    s.update(
+        camera_ok=_camera_ok,
+        alerts_enabled=alerts_enabled(),
+        schedule_active=is_within_schedule(),
+        schedule_label=f"{SCHEDULE_START_HOUR:02d}:00–{SCHEDULE_END_HOUR:02d}:00",
+    )
     return jsonify(s)
 
+
 @app.route("/alerts", methods=["POST"])
+@require_role("operator")
 def toggle_alerts():
-    from flask import request
-    if not _check_token_from_request(request):
-        return jsonify({"error": "unauthorized"}), 401
+    require_csrf()
     data = request.get_json(force=True)
-    val  = bool(data.get("enabled", True))
+    val = bool(data.get("enabled", True))
     set_alerts_enabled(val)
+    audit(VIDEO_DIR, _current_user()["username"], "alerts_enabled" if val else "alerts_disabled")
     return jsonify({"alerts_enabled": val})
 
+
 @app.route("/reset_background", methods=["POST"])
+@require_role("operator")
 def reset_background():
-    if not _check_token_from_request(request):
-        return jsonify({"error": "unauthorized"}), 401
+    require_csrf()
     detector.reset_background()
+    audit(VIDEO_DIR, _current_user()["username"], "background_reset")
     return jsonify({"status": "background model reset"})
 
 
 @app.route("/events")
+@require_login
 def events():
-    items = list_events(VIDEO_DIR)
+    items = list_events(VIDEO_DIR, request.args.get("limit", 30, type=int), request.args.get("offset", 0, type=int))
+    for item in items:
+        item["thumbnail_url"] = url_for("event_thumbnail", event_id=item["id"]) if item["thumb_path"] else None
+        item["video_url"] = url_for("event_video", event_id=item["id"])
+        item.pop("video_path", None)
+        item.pop("thumb_path", None)
     return jsonify(items)
 
 
-@app.route('/thumbs/<path:filename>')
-def thumbs(filename):
-    # serve thumbnail images from video dir
-    return send_from_directory(VIDEO_DIR, filename)
+def _event_media(event_id, field):
+    event = event_by_id(VIDEO_DIR, event_id)
+    if not event or not event.get(field):
+        abort(404)
+    media_path, root = os.path.realpath(event[field]), os.path.realpath(VIDEO_DIR)
+    if os.path.commonpath([root, media_path]) != root or not os.path.isfile(media_path):
+        abort(404)
+    return media_path
 
 
-@app.route('/videos/<path:filename>')
-def get_video(filename):
-    # protected access to raw video files
-    if not _check_token_from_request(request):
-        return jsonify({"error": "unauthorized"}), 401
-    return send_from_directory(VIDEO_DIR, filename)
+@app.route("/events/<int:event_id>/thumbnail")
+@require_login
+def event_thumbnail(event_id):
+    return send_file(_event_media(event_id, "thumb_path"), conditional=True, max_age=3600)
+
+
+@app.route("/events/<int:event_id>/video")
+@require_login
+def event_video(event_id):
+    return send_file(_event_media(event_id, "video_path"), conditional=True, as_attachment=request.args.get("download") == "1")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+_services_started = False
+_services_lock = threading.Lock()
+
+
+def start_services():
+    """Start the camera workers once (Gunicorn must run exactly one worker)."""
+    global _services_started
+    with _services_lock:
+        if _services_started:
+            return
+        initialize_security()
+        threading.Thread(target=capture_loop, daemon=True, name="capture").start()
+        threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+        threading.Thread(target=_video_cleanup_loop, daemon=True, name="video-cleanup").start()
+        _services_started = True
+        logger.info("CCTV background services started")
+
+
 if __name__ == "__main__":
-    # Capture thread
-    threading.Thread(target=capture_loop, daemon=True, name="capture").start()
-    # WhatsApp command listener
-    threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
-    # Video cleanup thread
-    threading.Thread(target=_video_cleanup_loop, daemon=True, name="video-cleanup").start()
+    initialize_security()
+    start_services()
     logger.info(f"CCTV starting on {socket.gethostname()} — alerts={'ON' if alerts_enabled() else 'OFF'}")
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    # Caddy is the network-facing service. Flask binds only to loopback.
+    app.run(host="127.0.0.1", port=5000, threaded=True)
