@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, session, url_for
 from motion import MotionDetector
-from db import audit, authenticate_user, create_user, ensure_db, event_by_id, insert_event, list_events, user_count
+from db import audit, authenticate_user, ensure_db, event_by_id, insert_event, list_events, provision_single_admin
 from model_utils import ensure_mobilenet
 import tempfile
 import os.path
@@ -498,12 +498,24 @@ def initialize_security():
     if not SECRET_KEY or len(SECRET_KEY) < 32:
         raise RuntimeError("CCTV_SECRET_KEY must be set to a random value of at least 32 characters")
     _ensure_video_dir()
-    if user_count(VIDEO_DIR) == 0:
-        if not BOOTSTRAP_PASSWORD:
-            raise RuntimeError("No users exist. Set CCTV_BOOTSTRAP_PASSWORD for the initial admin account.")
-        create_user(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD, "admin", allow_weak_password=True)
-        audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "bootstrap_admin_created")
-        logger.info("Initial CCTV admin account created")
+    if not BOOTSTRAP_PASSWORD:
+        raise RuntimeError("CCTV_BOOTSTRAP_PASSWORD must be set for the single administrator account.")
+    provision_single_admin(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD)
+    audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "single_admin_provisioned")
+    logger.info("Single CCTV administrator provisioned")
+
+
+@app.before_request
+def enforce_authenticated_application():
+    """Keep every application route private; only the credential form is public."""
+    if request.endpoint == "login":
+        return None
+    if _current_user():
+        return None
+    # Dashboard assets are not public either. The login view uses inline CSS.
+    if request.endpoint == "static":
+        abort(404)
+    return redirect(url_for("login", next=request.full_path if request.method == "GET" else None))
 
 
 # ── WhatsApp command listener ─────────────────────────────────────────────────
@@ -854,6 +866,7 @@ def video_feed():
 
 
 @app.route("/health")
+@require_login
 def health():
     return jsonify({"status": "ok", "camera": _camera_ok})
 

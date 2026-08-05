@@ -145,6 +145,41 @@ def create_user(default_dir: str, username: str, password: str, role: str = "adm
         conn.close()
 
 
+def provision_single_admin(default_dir: str, username: str, password: str):
+    """Make the configured administrator the only permitted local account.
+
+    This appliance intentionally has no account-management surface. A service
+    with zero users receives the configured admin; one user is refreshed from
+    protected environment configuration; anything else is a hard startup
+    failure rather than an ambiguous or less-secure state.
+    """
+    username = username.strip()
+    if not username or len(username) > 64:
+        raise ValueError("Username must be between 1 and 64 characters.")
+    if len(password) < 5:
+        raise ValueError("Password must be at least 5 characters.")
+    conn = _connection(default_dir)
+    try:
+        count = int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+        if count > 1:
+            raise RuntimeError("CCTV is configured for one account but multiple users exist.")
+        password_hash = generate_password_hash(password, method="scrypt")
+        if count == 0:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (username, password_hash, _now()),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET username = ?, password_hash = ?, role = 'admin', active = 1 "
+                "WHERE id = (SELECT id FROM users LIMIT 1)",
+                (username, password_hash),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def authenticate_user(default_dir: str, username: str, password: str):
     conn = _connection(default_dir)
     try:

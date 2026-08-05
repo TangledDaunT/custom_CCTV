@@ -40,11 +40,13 @@ class SecurityBoundaryTests(unittest.TestCase):
 
     def test_dashboard_events_and_video_require_login(self):
         self.assertEqual(self.client.get("/").status_code, 302)
+        self.assertEqual(self.client.get("/health").status_code, 302)
         self.assertEqual(self.client.get("/events").status_code, 302)
         self.assertEqual(self.client.get("/events/1/video").status_code, 302)
+        self.assertEqual(self.client.get("/static/app.css").status_code, 404)
 
     def test_control_requires_login_and_csrf(self):
-        self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 401)
+        self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 302)
         csrf = self.login()
         self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 400)
         self.assertEqual(
