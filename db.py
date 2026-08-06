@@ -6,7 +6,7 @@ choice. Every connection is short-lived which keeps it safe with Flask threads.
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -84,6 +84,12 @@ def ensure_db(default_dir: str) -> str:
                 recipient TEXT NOT NULL UNIQUE,
                 enabled INTEGER NOT NULL DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                ip_address TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_ts ON login_attempts(ip_address, ts DESC);
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
@@ -218,6 +224,29 @@ def get_notification_prefs(default_dir: str):
     try:
         rows = conn.execute("SELECT recipient, enabled FROM notification_prefs").fetchall()
         return {row['recipient']: bool(row['enabled']) for row in rows}
+    finally:
+        conn.close()
+
+
+def login_attempt_count(default_dir: str, ip_address: str, within_seconds: int = 300) -> int:
+    conn = _connection(default_dir)
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=within_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM login_attempts WHERE ip_address = ? AND ts >= ?",
+                (ip_address, cutoff),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def record_login_attempt(default_dir: str, ip_address: str):
+    conn = _connection(default_dir)
+    try:
+        conn.execute("INSERT INTO login_attempts (ts, ip_address) VALUES (?, ?)", (_now(), ip_address))
+        conn.commit()
     finally:
         conn.close()
 
