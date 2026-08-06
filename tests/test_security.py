@@ -18,12 +18,14 @@ os.environ.update(
 )
 
 import app  # noqa: E402
+from db import create_user  # noqa: E402
 
 
 class SecurityBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         app.initialize_security()
+        create_user(os.environ["VIDEO_DIR"], "viewer1", "viewer123", role="viewer", display_name="Viewer One", must_change_password=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -56,6 +58,11 @@ class SecurityBoundaryTests(unittest.TestCase):
 
     def test_unavailable_object_model_never_confirms_motion(self):
         self.assertEqual(app.detect_person_vehicle(None, None), [])
+
+    def test_must_change_password_redirects_after_login(self):
+        response = self.client.post("/login", data={"username": "viewer1", "password": "viewer123"})
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/change-password", response.headers.get("Location", ""))
 
 
 if __name__ == "__main__":
