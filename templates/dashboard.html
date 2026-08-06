@@ -33,6 +33,9 @@
         {% endif %}
         <button class="button secondary" id="fullscreen">⤢ Fullscreen</button>
       </div>
+      {% if user.role != 'admin' %}
+      <p style="margin-top:10px;color:var(--muted)">Viewer mode: live feed and event playback only.</p>
+      {% endif %}
     </section>
     <section class="status-grid" aria-label="System status">
       <article class="status-card"><span>Alerts</span><strong id="alert-state">—</strong><small id="schedule-state">Checking schedule</small></article>
