@@ -54,11 +54,13 @@ def ensure_db(default_dir: str) -> str:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name TEXT NOT NULL DEFAULT '',
                 password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('viewer', 'operator', 'admin')),
-                active INTEGER NOT NULL DEFAULT 1,
+                role TEXT NOT NULL CHECK(role IN ('viewer', 'admin')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                last_login_at TEXT
+                last_login TEXT
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +89,26 @@ def ensure_db(default_dir: str) -> str:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
         if "reviewed_at" not in columns:
             conn.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT")
+        user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "display_name" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+        if "is_active" not in user_columns:
+            if "active" in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+                conn.execute("UPDATE users SET is_active = COALESCE(active, 1)")
+            else:
+                conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        if "must_change_password" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        if "last_login" not in user_columns:
+            if "last_login_at" in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
+                conn.execute("UPDATE users SET last_login = last_login_at WHERE last_login IS NULL")
+            else:
+                conn.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
+        # Keep legacy role values valid after migration.
+        conn.execute("UPDATE users SET role = 'admin' WHERE role NOT IN ('admin', 'viewer')")
+        conn.execute("UPDATE users SET display_name = username WHERE display_name = '' OR display_name IS NULL")
         conn.commit()
         return get_db_path(default_dir)
     finally:
@@ -208,21 +230,34 @@ def user_count(default_dir: str) -> int:
         conn.close()
 
 
-def create_user(default_dir: str, username: str, password: str, role: str = "admin", allow_weak_password: bool = False):
+def _validate_password(password: str):
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
+    if not any(ch.isdigit() for ch in password):
+        raise ValueError("Password must include at least one number.")
+
+
+def create_user(
+    default_dir: str,
+    username: str,
+    password: str,
+    role: str = "viewer",
+    display_name: Optional[str] = None,
+    must_change_password: bool = False,
+):
     username = username.strip()
     if not username or len(username) > 64:
         raise ValueError("Username must be between 1 and 64 characters.")
-    if len(password) < 12 and not allow_weak_password:
-        raise ValueError("Password must be at least 12 characters.")
-    if len(password) < 5:
-        raise ValueError("Password must be at least 5 characters.")
-    if role not in {"viewer", "operator", "admin"}:
+    _validate_password(password)
+    if role not in {"viewer", "admin"}:
         raise ValueError("Invalid role.")
+    display_name = (display_name or username).strip()[:64]
     conn = _connection(default_dir)
     try:
         conn.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
-            (username, generate_password_hash(password, method="scrypt"), role, _now()),
+            "INSERT INTO users (username, display_name, password_hash, role, is_active, must_change_password, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (username, display_name, generate_password_hash(password), role, 1 if must_change_password else 0, _now()),
         )
         conn.commit()
     finally:
@@ -230,34 +265,19 @@ def create_user(default_dir: str, username: str, password: str, role: str = "adm
 
 
 def provision_single_admin(default_dir: str, username: str, password: str):
-    """Make the configured administrator the only permitted local account.
-
-    This appliance intentionally has no account-management surface. A service
-    with zero users receives the configured admin; one user is refreshed from
-    protected environment configuration; anything else is a hard startup
-    failure rather than an ambiguous or less-secure state.
-    """
+    """Create the initial administrator only when no users exist."""
     username = username.strip()
     if not username or len(username) > 64:
         raise ValueError("Username must be between 1 and 64 characters.")
-    if len(password) < 5:
-        raise ValueError("Password must be at least 5 characters.")
+    _validate_password(password)
     conn = _connection(default_dir)
     try:
         count = int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
-        if count > 1:
-            raise RuntimeError("CCTV is configured for one account but multiple users exist.")
-        password_hash = generate_password_hash(password, method="scrypt")
         if count == 0:
             conn.execute(
-                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-                (username, password_hash, _now()),
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET username = ?, password_hash = ?, role = 'admin', active = 1 "
-                "WHERE id = (SELECT id FROM users LIMIT 1)",
-                (username, password_hash),
+                "INSERT INTO users (username, display_name, password_hash, role, is_active, must_change_password, created_at) "
+                "VALUES (?, ?, ?, 'admin', 1, 0, ?)",
+                (username, username, generate_password_hash(password), _now()),
             )
         conn.commit()
     finally:
@@ -268,13 +288,103 @@ def authenticate_user(default_dir: str, username: str, password: str):
     conn = _connection(default_dir)
     try:
         row = conn.execute(
-            "SELECT id, username, password_hash, role, active FROM users WHERE username = ?", (username.strip(),)
+            "SELECT id, username, display_name, password_hash, role, is_active, must_change_password "
+            "FROM users WHERE username = ?",
+            (username.strip(),),
         ).fetchone()
-        if not row or not row["active"] or not check_password_hash(row["password_hash"], password):
+        if not row or not row["is_active"] or not check_password_hash(row["password_hash"], password):
             return None
-        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (_now(), row["id"]))
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (_now(), row["id"]))
         conn.commit()
-        return {"id": row["id"], "username": row["username"], "role": row["role"]}
+        return {
+            "id": row["id"],
+            "username": row["username"],
+            "display_name": row["display_name"] or row["username"],
+            "role": row["role"],
+            "must_change_password": bool(row["must_change_password"]),
+        }
+    finally:
+        conn.close()
+
+
+def list_users(default_dir: str):
+    conn = _connection(default_dir)
+    try:
+        rows = conn.execute(
+            "SELECT id, username, display_name, role, is_active, must_change_password, created_at, last_login "
+            "FROM users ORDER BY role DESC, username ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def update_user_active(default_dir: str, user_id: int, is_active: bool):
+    conn = _connection(default_dir)
+    try:
+        conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (1 if is_active else 0, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_user(default_dir: str, user_id: int):
+    conn = _connection(default_dir)
+    try:
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reset_user_password(default_dir: str, user_id: int, new_password: str):
+    _validate_password(new_password)
+    conn = _connection(default_dir)
+    try:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
+            (generate_password_hash(new_password), user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def change_own_password(default_dir: str, user_id: int, new_password: str):
+    _validate_password(new_password)
+    conn = _connection(default_dir)
+    try:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+            (generate_password_hash(new_password), user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user(default_dir: str, user_id: int):
+    conn = _connection(default_dir)
+    try:
+        row = conn.execute(
+            "SELECT id, username, display_name, role, is_active, must_change_password, created_at, last_login "
+            "FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_user_by_username(default_dir: str, username: str):
+    conn = _connection(default_dir)
+    try:
+        row = conn.execute(
+            "SELECT id, username, display_name, role, is_active, must_change_password, created_at, last_login "
+            "FROM users WHERE username = ?",
+            (username.strip(),),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
