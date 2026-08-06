@@ -1,69 +1,66 @@
-"""Fast regression tests for the privacy boundary of the web application."""
-
-import os
-import shutil
-import tempfile
-import unittest
-
-
-TEST_ROOT = tempfile.mkdtemp(prefix="cctv-tests-")
-os.environ.update(
-    CCTV_SECRET_KEY="a" * 64,
-    CCTV_BOOTSTRAP_USERNAME="admin",
-    CCTV_BOOTSTRAP_PASSWORD="test-password-123",
-    CCTV_COOKIE_SECURE="0",
-    VIDEO_DIR=os.path.join(TEST_ROOT, "media"),
-    CCTV_STATE_FILE=os.path.join(TEST_ROOT, "alerts_enabled"),
-    CCTV_SNAPSHOT_PATH=os.path.join(TEST_ROOT, "snapshot.jpg"),
-)
-
-import app  # noqa: E402
-from db import create_user  # noqa: E402
+def test_dashboard_events_and_video_require_login(client):
+    assert client.get("/").status_code == 302
+    assert client.get("/health").status_code == 302
+    assert client.get("/events").status_code == 302
+    assert client.get("/events/1/video").status_code == 302
+    assert client.get("/static/app.css").status_code == 200
 
 
-class SecurityBoundaryTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        app.initialize_security()
-        create_user(os.environ["VIDEO_DIR"], "viewer1", "viewer123", role="viewer", display_name="Viewer One", must_change_password=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(TEST_ROOT, ignore_errors=True)
-
-    def setUp(self):
-        self.client = app.app.test_client()
-
-    def login(self):
-        response = self.client.post("/login", data={"username": "admin", "password": "test-password-123"})
-        self.assertEqual(response.status_code, 302)
-        with self.client.session_transaction() as state:
-            return state["csrf_token"]
-
-    def test_dashboard_events_and_video_require_login(self):
-        self.assertEqual(self.client.get("/").status_code, 302)
-        self.assertEqual(self.client.get("/health").status_code, 302)
-        self.assertEqual(self.client.get("/events").status_code, 302)
-        self.assertEqual(self.client.get("/events/1/video").status_code, 302)
-        self.assertEqual(self.client.get("/static/app.css").status_code, 200)
-
-    def test_control_requires_login_and_csrf(self):
-        self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 302)
-        csrf = self.login()
-        self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 400)
-        self.assertEqual(
-            self.client.post("/alerts", json={"enabled": False}, headers={"X-CSRF-Token": csrf}).status_code,
-            200,
-        )
-
-    def test_unavailable_object_model_never_confirms_motion(self):
-        self.assertEqual(app.detect_person_vehicle(None, None), [])
-
-    def test_must_change_password_redirects_after_login(self):
-        response = self.client.post("/login", data={"username": "viewer1", "password": "viewer123"})
-        self.assertEqual(response.status_code, 302)
-        self.assertIn("/change-password", response.headers.get("Location", ""))
+def test_control_requires_login(client):
+    assert client.post("/alerts", json={"enabled": False}).status_code == 302
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_control_requires_csrf_when_logged_in(authed_admin, csrf_token):
+    assert authed_admin.post("/alerts", json={"enabled": False}).status_code == 400
+    assert (
+        authed_admin.post(
+            "/alerts",
+            json={"enabled": False},
+            headers={"X-CSRF-Token": csrf_token(authed_admin)},
+        ).status_code
+        == 200
+    )
+
+
+def test_unavailable_object_model_never_confirms_motion(app_module):
+    assert app_module.detect_person_vehicle(None, None) == []
+
+
+def test_must_change_password_redirects_after_login(db, app_module, client):
+    app_module.create_user(
+        app_module.VIDEO_DIR,
+        username="viewer1",
+        password="Viewer123",
+        role="viewer",
+        display_name="Viewer One",
+        must_change_password=True,
+    )
+    client.environ_base["REMOTE_ADDR"] = "198.51.100.77"
+    response = client.post("/login", data={"username": "viewer1", "password": "Viewer123"})
+    assert response.status_code == 302
+    assert "/change-password" in response.headers.get("Location", "")
+
+
+def test_login_rate_limit_returns_429_when_enabled(app_module):
+    previous = app_module.app.config.get("RATELIMIT_ENABLED", False)
+    app_module.app.config["RATELIMIT_ENABLED"] = True
+    client = app_module.app.test_client()
+    client.environ_base["REMOTE_ADDR"] = "203.0.113.10"
+
+    try:
+        for _ in range(10):
+            response = client.post("/login", data={"username": "missing", "password": "WrongPass1"})
+            assert response.status_code == 200
+
+        limited = client.post("/login", data={"username": "missing", "password": "WrongPass1"})
+        assert limited.status_code == 429
+        assert b"Too many attempts" in limited.data
+    finally:
+        app_module.app.config["RATELIMIT_ENABLED"] = previous
+
+
+def test_cookie_and_session_settings_are_test_safe(app_module):
+    app = app_module.app
+    assert app.config["SESSION_COOKIE_SECURE"] is False
+    assert app.config["SESSION_COOKIE_HTTPONLY"] is True
+    assert app.config["SESSION_COOKIE_SAMESITE"] == "Lax"
