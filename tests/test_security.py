@@ -43,7 +43,7 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertEqual(self.client.get("/health").status_code, 302)
         self.assertEqual(self.client.get("/events").status_code, 302)
         self.assertEqual(self.client.get("/events/1/video").status_code, 302)
-        self.assertEqual(self.client.get("/static/app.css").status_code, 404)
+        self.assertEqual(self.client.get("/static/app.css").status_code, 200)
 
     def test_control_requires_login_and_csrf(self):
         self.assertEqual(self.client.post("/alerts", json={"enabled": False}).status_code, 302)
