@@ -569,6 +569,12 @@ def require_csrf():
         abort(400, description="Invalid CSRF token")
 
 
+def _safe_next_target(raw_target: str) -> str:
+    if raw_target and raw_target.startswith("/") and not raw_target.startswith("//"):
+        return raw_target
+    return url_for("index")
+
+
 def initialize_security():
     """Validate secrets and bootstrap one admin only when there are no users."""
     if not SECRET_KEY or len(SECRET_KEY) < 32:
@@ -931,8 +937,7 @@ def login():
             audit(VIDEO_DIR, user["username"], "login")
             if session.get("must_change_password"):
                 return redirect(url_for("change_password"))
-            target = request.args.get("next", "")
-            return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("index"))
+            return redirect(_safe_next_target(request.args.get("next", "")))
         audit(VIDEO_DIR, username.strip()[:64] or None, "login_failed")
         error = "Invalid credentials."
     return render_template("login.html", error=error)
