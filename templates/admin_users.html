@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manage users · CCTV</title>
+  <style>
+    :root{color-scheme:dark}
+    body{margin:0;background:#0b0e14;color:#f1f5f9;font:15px/1.5 system-ui,sans-serif}
+    .wrap{max-width:1100px;margin:0 auto;padding:20px}
+    .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+    .card{background:#121722;border:1px solid #273246;border-radius:12px;padding:14px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;border-bottom:1px solid #273246;text-align:left;vertical-align:top}
+    .muted{color:#94a3b8}
+    .btn{border:1px solid #273246;background:#181f2d;color:#f1f5f9;border-radius:8px;padding:8px 10px;cursor:pointer}
+    .btn-danger{background:#4a1721;border-color:#7c2636}
+    .form-grid{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px}
+    input,select{min-height:40px;border:1px solid #273246;border-radius:8px;background:#0d111a;color:#f1f5f9;padding:0 10px}
+    .msg{padding:10px;border-radius:8px;margin:10px 0}
+    .ok{background:#123c2c;color:#d2ffe9}.err{background:#4a1721;color:#ffdce1}
+    @media(max-width:900px){.form-grid{grid-template-columns:1fr 1fr}th:nth-child(5),td:nth-child(5){display:none}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="top">
+      <h1>User management</h1>
+      <div><span class="muted">{{ user.display_name }}</span> · <a class="muted" href="{{ url_for('index') }}">Dashboard</a> · <a class="muted" href="{{ url_for('logout') }}">Logout</a></div>
+    </div>
+    {% if message %}<div class="msg ok">{{ message }}</div>{% endif %}
+    {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+    <section class="card" aria-labelledby="add-user">
+      <h2 id="add-user">Add user</h2>
+      <form method="post" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="add">
+        <input name="username" placeholder="username" required maxlength="64">
+        <input name="display_name" placeholder="display name" required maxlength="64">
+        <select name="role"><option value="viewer">viewer</option><option value="admin">admin</option></select>
+        <input name="temp_password" placeholder="temporary password" required>
+        <button class="btn" type="submit">Create user</button>
+      </form>
+    </section>
+
+    <section class="card" style="margin-top:14px" aria-labelledby="users-list">
+      <h2 id="users-list">Users</h2>
+      <table>
+        <thead>
+          <tr><th>Display name</th><th>Username</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+        {% for u in users %}
+          <tr>
+            <td>{{ u.display_name }}</td>
+            <td>{{ u.username }}</td>
+            <td>{{ u.role }}</td>
+            <td>{{ 'active' if u.is_active else 'inactive' }}{% if u.must_change_password %} · must change password{% endif %}</td>
+            <td>{{ u.last_login or '—' }}</td>
+            <td>
+              {% if u.id != user.id %}
+                <form method="post" style="display:inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="user_id" value="{{ u.id }}">
+                  {% if u.is_active %}
+                    <input type="hidden" name="action" value="deactivate"><button class="btn btn-danger" type="submit">Deactivate</button>
+                  {% else %}
+                    <input type="hidden" name="action" value="reactivate"><button class="btn" type="submit">Reactivate</button>
+                  {% endif %}
+                </form>
+                <form method="post" style="display:inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="delete">
+                  <input type="hidden" name="user_id" value="{{ u.id }}">
+                  <button class="btn btn-danger" type="submit">Delete</button>
+                </form>
+              {% endif %}
+              <form method="post" style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="action" value="reset_password">
+                <input type="hidden" name="user_id" value="{{ u.id }}">
+                <input name="temp_password" placeholder="new temp password" required style="min-width:150px">
+                <button class="btn" type="submit">Reset password</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
