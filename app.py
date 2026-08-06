@@ -10,12 +10,20 @@ import socket
 from collections import deque
 from datetime import datetime
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from motion import MotionDetector
 from db import (
     audit,
     authenticate_user,
+    change_own_password,
+    create_user,
+    delete_user,
     ensure_db,
     event_by_id,
+    get_user,
+    get_user_by_username,
+    list_users,
     insert_event,
     list_events,
     provision_single_admin,
@@ -23,6 +31,9 @@ from db import (
     insert_notification,
     set_notification_pref,
     get_notification_prefs,
+    reset_user_password,
+    update_user_active,
+    user_count,
 )
 from model_utils import ensure_mobilenet
 import tempfile
@@ -114,6 +125,13 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=8 * 60 * 60,
     MAX_CONTENT_LENGTH=64 * 1024,
 )
+limiter = Limiter(get_remote_address, app=app, storage_uri="memory://", default_limits=[])
+
+FAMILY_USERS = [
+    {"username": "shreyansh", "display_name": "Shreyansh", "role": "admin"},
+    {"username": "dad", "display_name": "Dad", "role": "viewer"},
+    {"username": "mom", "display_name": "Mom", "role": "viewer"},
+]
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _frame_lock    = threading.Lock()
@@ -504,13 +522,19 @@ def send_whatsapp_status(message: str):
         _wacli_send_text(number, message)
 
 
-ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
+ROLE_RANK = {"viewer": 1, "admin": 2}
 
 
 def _current_user():
     if not session.get("user_id"):
         return None
-    return {"id": session["user_id"], "username": session["username"], "role": session["role"]}
+    return {
+        "id": session["user_id"],
+        "username": session["username"],
+        "display_name": session.get("display_name", session["username"]),
+        "role": session["role"],
+        "must_change_password": bool(session.get("must_change_password", False)),
+    }
 
 
 def require_login(fn):
@@ -519,6 +543,7 @@ def require_login(fn):
         if not _current_user():
             return redirect(url_for("login", next=request.full_path if request.method == "GET" else None))
         return fn(*args, **kwargs)
+
     return wrapper
 
 
@@ -532,7 +557,9 @@ def require_role(role):
             if ROLE_RANK.get(user["role"], 0) < ROLE_RANK[role]:
                 return jsonify({"error": "insufficient permissions"}), 403
             return fn(*args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -543,28 +570,32 @@ def require_csrf():
 
 
 def initialize_security():
-    """Validate secrets and create the first account only from deployment config."""
+    """Validate secrets and bootstrap one admin only when there are no users."""
     if not SECRET_KEY or len(SECRET_KEY) < 32:
         raise RuntimeError("CCTV_SECRET_KEY must be set to a random value of at least 32 characters")
     _ensure_video_dir()
-    if not BOOTSTRAP_PASSWORD:
-        raise RuntimeError("CCTV_BOOTSTRAP_PASSWORD must be set for the single administrator account.")
-    provision_single_admin(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD)
-    audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "single_admin_provisioned")
-    logger.info("Single CCTV administrator provisioned")
+    existing_users = user_count(VIDEO_DIR)
+    if existing_users == 0:
+        if not BOOTSTRAP_PASSWORD:
+            raise RuntimeError("CCTV_BOOTSTRAP_PASSWORD must be set when no users exist.")
+        provision_single_admin(VIDEO_DIR, BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD)
+        audit(VIDEO_DIR, BOOTSTRAP_USERNAME, "bootstrap_admin_provisioned")
+        logger.info("Bootstrap administrator provisioned")
+    elif BOOTSTRAP_PASSWORD:
+        logger.warning("CCTV_BOOTSTRAP_PASSWORD is still set but users already exist; remove it from environment")
 
 
 @app.before_request
 def enforce_authenticated_application():
-    """Keep every application route private; only the credential form is public."""
-    if request.endpoint == "login":
+    """Keep application routes private and enforce password-change flow."""
+    if request.endpoint in {"login", "static", "shared_video"}:
         return None
-    if _current_user():
-        return None
-    # Dashboard assets are not public either. The login view uses inline CSS.
-    if request.endpoint == "static":
-        abort(404)
-    return redirect(url_for("login", next=request.full_path if request.method == "GET" else None))
+    user = _current_user()
+    if not user:
+        return redirect(url_for("login", next=request.full_path if request.method == "GET" else None))
+    if user.get("must_change_password") and request.endpoint not in {"change_password", "logout"}:
+        return redirect(url_for("change_password"))
+    return None
 
 
 # ── WhatsApp command listener ─────────────────────────────────────────────────
@@ -878,6 +909,7 @@ def index():
 
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per 5 minutes")
 def login():
     if _current_user():
         return redirect(url_for("index"))
@@ -887,23 +919,117 @@ def login():
         user = authenticate_user(VIDEO_DIR, username, password)
         if user:
             session.clear()
-            session.update(user_id=user["id"], username=user["username"], role=user["role"], csrf_token=secrets.token_urlsafe(32))
+            session.update(
+                user_id=user["id"],
+                username=user["username"],
+                display_name=user.get("display_name", user["username"]),
+                role=user["role"],
+                must_change_password=bool(user.get("must_change_password", False)),
+                csrf_token=secrets.token_urlsafe(32),
+            )
             session.permanent = True
             audit(VIDEO_DIR, user["username"], "login")
+            if session.get("must_change_password"):
+                return redirect(url_for("change_password"))
             target = request.args.get("next", "")
             return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("index"))
         audit(VIDEO_DIR, username.strip()[:64] or None, "login_failed")
-        error = "Invalid username or password."
+        error = "Invalid credentials."
     return render_template("login.html", error=error)
 
 
-@app.route("/logout", methods=["POST"])
+@app.route("/logout", methods=["GET", "POST"])
 @require_login
 def logout():
-    require_csrf()
+    if request.method == "POST":
+        require_csrf()
     audit(VIDEO_DIR, _current_user()["username"], "logout")
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+@require_login
+def change_password():
+    error = None
+    if request.method == "POST":
+        require_csrf()
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        if new_password != confirm_password:
+            error = "Passwords do not match."
+        else:
+            try:
+                change_own_password(VIDEO_DIR, _current_user()["id"], new_password)
+                session["must_change_password"] = False
+                audit(VIDEO_DIR, _current_user()["username"], "password_changed")
+                return redirect(url_for("index"))
+            except ValueError as exc:
+                error = str(exc)
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return render_template("change_password.html", error=error, user=_current_user(), csrf_token=session["csrf_token"])
+
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@require_role("admin")
+def admin_users():
+    message = None
+    error = None
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    if request.method == "POST":
+        require_csrf()
+        action = request.form.get("action", "")
+        try:
+            if action == "add":
+                username = request.form.get("username", "")
+                display_name = request.form.get("display_name", "")
+                role = request.form.get("role", "viewer")
+                temp_password = request.form.get("temp_password", "")
+                create_user(VIDEO_DIR, username, temp_password, role=role, display_name=display_name, must_change_password=True)
+                message = f"User {username.strip()} created. Temporary password: {temp_password}"
+                audit(VIDEO_DIR, _current_user()["username"], "user_created", username.strip()[:64])
+            elif action == "deactivate":
+                target_id = int(request.form.get("user_id", "0"))
+                if target_id == _current_user()["id"]:
+                    raise ValueError("You cannot deactivate your own account.")
+                update_user_active(VIDEO_DIR, target_id, False)
+                audit(VIDEO_DIR, _current_user()["username"], "user_deactivated", str(target_id))
+                message = "User deactivated."
+            elif action == "reactivate":
+                target_id = int(request.form.get("user_id", "0"))
+                update_user_active(VIDEO_DIR, target_id, True)
+                audit(VIDEO_DIR, _current_user()["username"], "user_reactivated", str(target_id))
+                message = "User reactivated."
+            elif action == "reset_password":
+                target_id = int(request.form.get("user_id", "0"))
+                temp_password = request.form.get("temp_password", "")
+                reset_user_password(VIDEO_DIR, target_id, temp_password)
+                audit(VIDEO_DIR, _current_user()["username"], "user_password_reset", str(target_id))
+                message = f"Temporary password reset to: {temp_password}"
+            elif action == "delete":
+                target_id = int(request.form.get("user_id", "0"))
+                if target_id == _current_user()["id"]:
+                    raise ValueError("You cannot delete your own account.")
+                delete_user(VIDEO_DIR, target_id)
+                audit(VIDEO_DIR, _current_user()["username"], "user_deleted", str(target_id))
+                message = "User deleted."
+            else:
+                raise ValueError("Invalid admin action.")
+        except ValueError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Failed to update user."
+    users = list_users(VIDEO_DIR)
+    return render_template(
+        "admin_users.html",
+        users=users,
+        user=_current_user(),
+        csrf_token=session["csrf_token"],
+        message=message,
+        error=error,
+    )
 
 
 @app.route("/video_feed")
@@ -932,7 +1058,7 @@ def stats():
 
 
 @app.route("/alerts", methods=["POST"])
-@require_role("operator")
+@require_role("admin")
 def toggle_alerts():
     require_csrf()
     data = request.get_json(force=True)
@@ -943,7 +1069,7 @@ def toggle_alerts():
 
 
 @app.route("/reset_background", methods=["POST"])
-@require_role("operator")
+@require_role("admin")
 def reset_background():
     require_csrf()
     detector.reset_background()
@@ -982,7 +1108,7 @@ def events():
 
 # Flag an event (mark important)
 @app.route('/events/<int:event_id>/flag', methods=['POST'])
-@require_role('operator')
+@require_role('admin')
 def event_flag(event_id):
     require_csrf()
     data = request.get_json(force=True)
@@ -1027,7 +1153,7 @@ def _verify_share_token(token: str):
 
 
 @app.route('/events/<int:event_id>/share', methods=['POST'])
-@require_role('operator')
+@require_role('admin')
 def event_share(event_id):
     require_csrf()
     data = request.get_json(force=True)
@@ -1053,7 +1179,7 @@ def shared_video(token):
 
 # Sensitivity/settings endpoint
 @app.route('/settings/sensitivity', methods=['POST'])
-@require_role('operator')
+@require_role('admin')
 def set_sensitivity():
     require_csrf()
     data = request.get_json(force=True)
@@ -1084,7 +1210,7 @@ def set_sensitivity():
 
 # Snapshot endpoint: save a quick JPEG and return a URL
 @app.route('/snapshot', methods=['POST'])
-@require_role('operator')
+@require_role('admin')
 def snapshot():
     require_csrf()
     _ensure_video_dir()
@@ -1112,7 +1238,7 @@ def snapshot_image(filename):
 
 # Notification preferences
 @app.route('/notification_prefs', methods=['GET','POST'])
-@require_role('operator')
+@require_role('admin')
 def notification_prefs():
     if request.method == 'GET':
         prefs = get_notification_prefs(VIDEO_DIR)
@@ -1129,6 +1255,40 @@ def notification_prefs():
         except Exception as e:
             logger.error(f"Notification prefs update failed: {e}")
             return jsonify({'error': 'failed to update prefs'}), 500
+
+
+def _random_temp_password() -> str:
+    return f"{secrets.token_urlsafe(8)}9"
+
+
+def seed_family_users():
+    created = []
+    for member in FAMILY_USERS:
+        if get_user_by_username(VIDEO_DIR, member["username"]):
+            continue
+        temp_password = _random_temp_password()
+        create_user(
+            VIDEO_DIR,
+            username=member["username"],
+            display_name=member["display_name"],
+            role=member["role"],
+            password=temp_password,
+            must_change_password=True,
+        )
+        created.append((member["username"], temp_password, member["role"]))
+    return created
+
+
+@app.cli.command("seed-users")
+def seed_users_cli():
+    """Create initial family users with temporary passwords."""
+    created = seed_family_users()
+    if not created:
+        print("No users created. All family users already exist.")
+        return
+    print("Created users (temporary passwords):")
+    for username, temp_password, role in created:
+        print(f"- {username} ({role}): {temp_password}")
 
 
 def _event_media(event_id, field):
