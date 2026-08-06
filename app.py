@@ -604,6 +604,13 @@ def enforce_authenticated_application():
     return None
 
 
+@app.errorhandler(429)
+def too_many_requests(_err):
+    if request.endpoint == "login":
+        return render_template("login.html", error="Too many attempts. Try again in a few minutes."), 429
+    return jsonify({"error": "rate limit exceeded"}), 429
+
+
 # ── WhatsApp command listener ─────────────────────────────────────────────────
 # Authorised senders — only these JIDs can control the system
 COMMAND_JIDS = {f"{n}@s.whatsapp.net" for n in ALERT_NUMBERS}
