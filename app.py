@@ -109,6 +109,7 @@ SCHEDULE_END_HOUR   = int(os.environ.get("CCTV_SCHEDULE_END_HOUR", "6"))
 WACLI_PATH    = os.environ.get("WACLI_PATH", "/home/linuxbrew/.linuxbrew/bin/wacli")
 ALERT_NUMBERS = [number.strip() for number in os.environ.get("CCTV_ALERT_NUMBERS", "").split(",") if number.strip()]
 SNAPSHOT_PATH = os.environ.get("CCTV_SNAPSHOT_PATH", "/var/lib/cctv/cctv_snapshot.jpg")
+DISABLE_OBJECT_FILTER = os.environ.get("DISABLE_OBJECT_FILTER", "0") == "1"
 
 # State file — persists stop/start across reboots
 STATE_FILE = os.environ.get("CCTV_STATE_FILE", "/var/lib/cctv/alerts_enabled")
@@ -184,14 +185,17 @@ detector = MotionDetector(
 
 # Load object detection model (MobileNet-SSD) for person/vehicle filtering
 _dnn_net = None
-try:
-    _dnn_net = ensure_mobilenet(VIDEO_DIR)
-    if _dnn_net is not None:
-        logger.info("MobileNet-SSD loaded for object filtering")
-    else:
-        logger.error("MobileNet-SSD not available; alerts are fail-closed until the model is provisioned")
-except Exception as e:
-    logger.error(f"Failed to initialize object detection model: {e}")
+if DISABLE_OBJECT_FILTER:
+    logger.warning("Object filter disabled via DISABLE_OBJECT_FILTER=1; running in motion-only mode")
+else:
+    try:
+        _dnn_net = ensure_mobilenet(VIDEO_DIR)
+        if _dnn_net is not None:
+            logger.info("MobileNet-SSD loaded for object filtering")
+        else:
+            logger.error("MobileNet-SSD not available; alerts are fail-closed until the model is provisioned")
+    except Exception as e:
+        logger.error(f"Failed to initialize object detection model: {e}")
 
 
 def detect_person_vehicle(frame, net):
@@ -690,16 +694,19 @@ def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
         reason = "alerts disabled" if not alerts_enabled() else "outside schedule"
         logger.info(f"Motion detected — skipping alert ({reason})")
         return
-    logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
-    if _dnn_net is None:
-        logger.error("Motion suppressed: object model unavailable (fail-closed)")
-        return
-    verified = verify_moving_object(frame)
-    if not verified:
-        logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
-        return
-    logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
-                verified["label"], verified["confidence"] * 100, verified["movement_px"])
+    if DISABLE_OBJECT_FILTER:
+        logger.info(f"Motion candidate: {len(contours)} region(s) — object filter disabled, recording and alerting")
+    else:
+        logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
+        if _dnn_net is None:
+            logger.error("Motion suppressed: object model unavailable (fail-closed)")
+            return
+        verified = verify_moving_object(frame)
+        if not verified:
+            logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
+            return
+        logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
+                    verified["label"], verified["confidence"] * 100, verified["movement_px"])
     start_record_and_alert(contours, frame, avg_score)
 
 
@@ -1336,7 +1343,12 @@ def start_services():
             return
         initialize_security()
         threading.Thread(target=capture_loop, daemon=True, name="capture").start()
-        threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+        if ALERT_NUMBERS and os.path.isfile(WACLI_PATH) and os.access(WACLI_PATH, os.X_OK):
+            threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
+        elif not ALERT_NUMBERS:
+            logger.info("WhatsApp command listener disabled: CCTV_ALERT_NUMBERS is not configured")
+        else:
+            logger.warning("WhatsApp command listener disabled: WACLI_PATH is not executable (%s)", WACLI_PATH)
         threading.Thread(target=_video_cleanup_loop, daemon=True, name="video-cleanup").start()
         _services_started = True
         logger.info("CCTV background services started")

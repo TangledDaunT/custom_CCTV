@@ -89,6 +89,12 @@ def ensure_db(default_dir: str) -> str:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
         if "reviewed_at" not in columns:
             conn.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT")
+        if "flagged" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
+        if "camera" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN camera TEXT DEFAULT 'cam0'")
+        if "label" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN label TEXT")
         user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         if "display_name" not in user_columns:
             conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
