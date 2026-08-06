@@ -389,6 +389,10 @@ def get_user_by_username(default_dir: str, username: str):
         conn.close()
 
 
+def user_exists(default_dir: str, username: str) -> bool:
+    return get_user_by_username(default_dir, username) is not None
+
+
 def audit(default_dir: str, username: Optional[str], action: str, detail: Optional[str] = None):
     conn = _connection(default_dir)
     try:

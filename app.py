@@ -21,18 +21,16 @@ from db import (
     delete_user,
     ensure_db,
     event_by_id,
-    get_user,
-    get_user_by_username,
     list_users,
+    flag_event,
+    set_notification_pref,
+    get_notification_prefs,
     insert_event,
     list_events,
     provision_single_admin,
-    flag_event,
-    insert_notification,
-    set_notification_pref,
-    get_notification_prefs,
     reset_user_password,
     update_user_active,
+    user_exists,
     user_count,
 )
 from model_utils import ensure_mobilenet
@@ -1276,7 +1274,7 @@ def _random_temp_password() -> str:
 def seed_family_users():
     created = []
     for member in FAMILY_USERS:
-        if get_user_by_username(VIDEO_DIR, member["username"]):
+        if user_exists(VIDEO_DIR, member["username"]):
             continue
         temp_password = _random_temp_password()
         create_user(
