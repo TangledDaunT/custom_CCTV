@@ -79,6 +79,16 @@ Home screen** option. The dashboard is touch-first, includes PWA metadata for
 standalone launch, and supports event playback directly on Android. The live
 view also supports fullscreen mode and larger touch targets for quick actions.
 
+## Multi-user access control
+
+- Authentication is invite-only. There is no public registration endpoint.
+- Administrators can manage family accounts at `/admin/users` (add, deactivate,
+  delete, and reset passwords).
+- Password resets are temporary and force a password change on next login.
+- When no users exist, startup provisions one bootstrap admin using
+  `CCTV_BOOTSTRAP_PASSWORD`. Once users exist, bootstrap credentials are ignored.
+- Login attempts are rate-limited per IP to reduce brute-force risk.
+
 ## Notes
 - Runtime configuration lives in `/etc/cctv/cctv.env`; see
   [`cctv.env.example`](cctv.env.example). Camera resolution, FPS, schedule,
