@@ -32,13 +32,14 @@
 
     <section class="card" aria-labelledby="add-user">
       <h2 id="add-user">Add user</h2>
+      <p class="muted">Invite-only access: users can only be created by an admin from this page.</p>
       <form method="post" class="form-grid">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="action" value="add">
         <input name="username" placeholder="username" required maxlength="64">
         <input name="display_name" placeholder="display name" required maxlength="64">
         <select name="role"><option value="viewer">viewer</option><option value="admin">admin</option></select>
-        <input name="temp_password" placeholder="temporary password" required>
+        <input name="temp_password" placeholder="temporary password (min 8 + number)" required>
         <button class="btn" type="submit">Create user</button>
       </form>
     </section>
