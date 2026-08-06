@@ -11,7 +11,9 @@
   <header class="topbar">
     <a class="brand" href="/" aria-label="CCTV dashboard"><span>◉</span> CCTV</a>
     <div class="topbar-right"><span class="status-dot" id="connection-dot"></span><span id="connection-label">Connecting</span>
-      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="text-button">Sign out</button></form>
+      <span aria-label="Signed in user">{{ user.display_name }}</span>
+      {% if user.role == 'admin' %}<a class="text-button" href="{{ url_for('admin_users') }}">Manage users</a>{% endif %}
+      <a class="text-button" href="{{ url_for('logout') }}">Logout</a>
     </div>
   </header>
   <main class="app-shell">
@@ -19,7 +21,7 @@
       <div class="section-heading"><div><p class="eyebrow">{{ hostname }}</p><h1 id="live-title">Live view</h1></div><span class="live-pill"><i></i> LIVE</span></div>
       <div class="video-frame"><img id="feed" src="{{ url_for('video_feed') }}" alt="Live CCTV camera feed" role="img" aria-label="Live camera feed"></div>
       <div class="quick-actions" role="toolbar" aria-label="Quick actions">
-        {% if user.role in ['operator', 'admin'] %}
+        {% if user.role == 'admin' %}
         <button class="button danger" id="stop-alerts">Pause alerts</button>
         <button class="button success" id="start-alerts">Enable alerts</button>
         <button class="button secondary" id="reset-background">Reset detection</button>
@@ -60,7 +62,7 @@
   </main>
   <dialog id="player-dialog" class="player-dialog"><button class="close-button" aria-label="Close video">×</button><video id="event-player" controls playsinline></video><p id="player-caption"></p></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role in ['operator', 'admin'])|tojson }} };</script>
+  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role == 'admin')|tojson }} };</script>
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>
