@@ -146,9 +146,10 @@ def _load_alert_state():
     # Default ON. If stopped before reboot, state file contains "0"
     if os.path.exists(STATE_FILE):
         try:
-            return open(STATE_FILE).read().strip() != "0"
-        except Exception:
-            pass
+            with open(STATE_FILE) as state_file:
+                return state_file.read().strip() != "0"
+        except Exception as exc:
+            logger.warning("Failed to read alert state file %s: %s", STATE_FILE, exc)
     return True
 
 _alerts_enabled      = _load_alert_state()
@@ -354,8 +355,8 @@ def _ensure_video_dir():
         # ensure DB exists in video dir
         try:
             ensure_db(VIDEO_DIR)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Failed to initialize event database in %s: %s", VIDEO_DIR, exc)
     except Exception as e:
         logger.error(f"Failed to create video dir {VIDEO_DIR}: {e}")
 
@@ -382,8 +383,8 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
             try:
                 if os.path.exists(avi_path):
                     os.remove(avi_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to remove partial recording %s: %s", avi_path, exc)
             return
 
         # Write prebuffer frames
@@ -414,8 +415,8 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
         # finalize
         try:
             writer.release()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Video writer release failed for %s: %s", avi_path, exc)
         writer = None
         logger.info(f"Finished recording — frames_written={frames_written}; avi_exists={os.path.exists(avi_path)}")
 
@@ -443,8 +444,8 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
                 # remove the avi to save space
                 try:
                     os.remove(avi_path)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to remove temporary AVI %s: %s", avi_path, exc)
         except Exception as e:
             logger.error(f"ffmpeg transcode failed: {e}")
 
@@ -481,8 +482,8 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
         try:
             if writer is not None:
                 writer.release()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Final writer cleanup failed for %s: %s", avi_path, exc)
 
 
 def start_record_and_alert(contours, frame, avg_score=0.0):
@@ -778,8 +779,8 @@ def capture_loop():
                         # also update latest bgr for recorder
                         global _latest_bgr
                         _latest_bgr = annotated.copy()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Frame buffer update failed: %s", exc)
 
             elapsed    = time.monotonic() - t0
             sleep_for  = frame_interval - elapsed

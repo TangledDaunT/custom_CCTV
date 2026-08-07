@@ -2,10 +2,102 @@ import importlib
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import secrets
+from types import SimpleNamespace
 
 import pytest
+
+
+def _install_fake_cv2_if_missing():
+    try:
+        import cv2  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    class _FakeBgSubtractor:
+        def apply(self, frame):
+            return frame
+
+    class _FakeVideoWriter:
+        def __init__(self, path, *_args, **_kwargs):
+            self.path = path
+            self._opened = True
+
+        def isOpened(self):
+            return self._opened
+
+        def write(self, _frame):
+            return True
+
+        def release(self):
+            self._opened = False
+
+    class _FakeVideoCapture:
+        def __init__(self, *_args, **_kwargs):
+            self._opened = False
+
+        def isOpened(self):
+            return self._opened
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return True
+
+    class _FakeBuffer:
+        def tobytes(self):
+            return b""
+
+    def _fake_imwrite(path, _frame, _opts=None):
+        with open(path, "wb") as out:
+            out.write(b"fake-image")
+        return True
+
+    fake_cv2 = SimpleNamespace(
+        MORPH_ELLIPSE=0,
+        MORPH_OPEN=0,
+        COLOR_BGR2GRAY=0,
+        THRESH_BINARY=0,
+        RETR_EXTERNAL=0,
+        CHAIN_APPROX_SIMPLE=0,
+        FONT_HERSHEY_SIMPLEX=0,
+        IMWRITE_JPEG_QUALITY=1,
+        CAP_V4L2=0,
+        CAP_PROP_FRAME_WIDTH=3,
+        CAP_PROP_FRAME_HEIGHT=4,
+        CAP_PROP_FPS=5,
+        CAP_PROP_BUFFERSIZE=6,
+        dnn=SimpleNamespace(
+            blobFromImage=lambda *args, **kwargs: b"",
+            readNetFromCaffe=lambda *_args, **_kwargs: None,
+        ),
+        createBackgroundSubtractorMOG2=lambda *args, **kwargs: _FakeBgSubtractor(),
+        getStructuringElement=lambda *args, **kwargs: [],
+        cvtColor=lambda frame, *_args, **_kwargs: frame,
+        GaussianBlur=lambda frame, *_args, **_kwargs: frame,
+        threshold=lambda frame, *_args, **_kwargs: (None, frame),
+        morphologyEx=lambda frame, *_args, **_kwargs: frame,
+        dilate=lambda frame, *_args, **_kwargs: frame,
+        findContours=lambda *_args, **_kwargs: ([], None),
+        contourArea=lambda *_args, **_kwargs: 0,
+        boundingRect=lambda *_args, **_kwargs: (0, 0, 0, 0),
+        rectangle=lambda frame, *_args, **_kwargs: frame,
+        putText=lambda frame, *_args, **_kwargs: frame,
+        resize=lambda frame, *_args, **_kwargs: frame,
+        imwrite=_fake_imwrite,
+        imencode=lambda *_args, **_kwargs: (True, _FakeBuffer()),
+        VideoWriter_fourcc=lambda *_args, **_kwargs: 0,
+        VideoWriter=lambda *args, **kwargs: _FakeVideoWriter(*args, **kwargs),
+        VideoCapture=lambda *args, **kwargs: _FakeVideoCapture(*args, **kwargs),
+    )
+    sys.modules["cv2"] = fake_cv2
 
 
 @pytest.fixture(scope="session")
@@ -22,6 +114,7 @@ def app_module():
         EVENT_DB_PATH=os.path.join(test_root, "events.db"),
     )
     os.makedirs(os.environ["VIDEO_DIR"], exist_ok=True)
+    _install_fake_cv2_if_missing()
 
     app_module = importlib.import_module("app")
     app_module.app.config.update(TESTING=True, RATELIMIT_ENABLED=False)

@@ -2,8 +2,6 @@ import os
 import sqlite3
 from pathlib import Path
 
-import numpy as np
-
 
 def _seed_event(app_module):
     media_dir = Path(app_module.VIDEO_DIR)
@@ -161,18 +159,31 @@ def test_snapshot_returns_503_without_frame_for_admin(authed_admin, csrf_token):
 
 
 def test_snapshot_saves_with_fake_frame(authed_admin, csrf_token, app_module):
-    app_module._latest_bgr = np.zeros((24, 24, 3), dtype=np.uint8)
+    class _FakeFrame:
+        def copy(self):
+            return self
 
-    response = authed_admin.post(
-        "/snapshot",
-        headers={"X-CSRF-Token": csrf_token(authed_admin)},
-    )
+    def _fake_imwrite(path, _frame, _opts):
+        Path(path).write_bytes(b"fake-jpg-bytes")
+        return True
 
-    assert response.status_code == 200
-    data = response.get_json()
-    assert "url" in data
-    saved = Path(app_module.VIDEO_DIR) / data["url"].rsplit("/", 1)[-1]
-    assert saved.exists()
+    app_module._latest_bgr = _FakeFrame()
+    original_imwrite = app_module.cv2.imwrite
+    app_module.cv2.imwrite = _fake_imwrite
+
+    try:
+        response = authed_admin.post(
+            "/snapshot",
+            headers={"X-CSRF-Token": csrf_token(authed_admin)},
+        )
+
+        assert response.status_code == 200
+        data = response.get_json()
+        assert "url" in data
+        saved = Path(app_module.VIDEO_DIR) / data["url"].rsplit("/", 1)[-1]
+        assert saved.exists()
+    finally:
+        app_module.cv2.imwrite = original_imwrite
 
 
 def test_alert_toggle_denied_for_viewer(authed_viewer, csrf_token):
