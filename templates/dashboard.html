@@ -20,7 +20,7 @@
   <main class="app-shell">
     <section class="hero" aria-labelledby="live-title">
       <div class="section-heading"><div><p class="eyebrow">{{ hostname }}</p><h1 id="live-title">Live view</h1></div><span class="live-pill"><i></i> LIVE</span></div>
-      <div class="video-frame"><video id="feed" muted autoplay playsinline aria-label="Live CCTV camera feed"></video></div>
+      <div class="video-frame"><img id="feed" src="{{ url_for('video_feed') }}" alt="Live CCTV camera feed" role="img" aria-label="Live camera feed"></div>
       <div class="quick-actions" role="toolbar" aria-label="Quick actions">
         {% if user.role == 'admin' %}
         <button class="button danger" id="stop-alerts">Pause alerts</button>
@@ -66,8 +66,7 @@
   </main>
   <dialog id="player-dialog" class="player-dialog"><button class="close-button" aria-label="Close video">×</button><video id="event-player" controls playsinline></video><p id="player-caption"></p></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js" defer></script>
-  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role == 'admin')|tojson }}, hlsUrl: {{ url_for('live_hls', filename='live.m3u8')|tojson }}, mjpegUrl: {{ url_for('video_feed')|tojson }} };</script>
+  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role == 'admin')|tojson }} };</script>
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>

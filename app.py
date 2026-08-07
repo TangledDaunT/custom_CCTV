@@ -81,7 +81,7 @@ VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
 VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
 FFMPEG_CRF              = os.environ.get("FFMPEG_CRF", "23")
 FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
-HLS_ENABLED             = os.environ.get("CCTV_HLS_ENABLED", "1") == "1"
+HLS_ENABLED             = os.environ.get("CCTV_HLS_ENABLED", "0") == "1"
 HLS_DIR                 = os.environ.get("CCTV_HLS_DIR", "/var/lib/cctv/hls")
 HLS_SEGMENT_SECONDS     = int(os.environ.get("CCTV_HLS_SEGMENT_SECONDS", "2"))
 HLS_LIST_SIZE           = int(os.environ.get("CCTV_HLS_LIST_SIZE", "5"))

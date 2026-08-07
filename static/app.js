@@ -7,31 +7,6 @@ const api = async (path, options = {}) => {
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Request failed');
   return response;
 };
-function startLiveStream() {
-  const video = $('feed');
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = CCTV.hlsUrl;
-    video.play().catch(() => {});
-    return;
-  }
-  if (window.Hls && Hls.isSupported()) {
-    const hls = new Hls({lowLatencyMode: true, liveSyncDurationCount: 3});
-    hls.loadSource(CCTV.hlsUrl);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data.fatal) startMjpegFallback(video);
-    });
-    return;
-  }
-  startMjpegFallback(video);
-}
-function startMjpegFallback(video) {
-  // Older browsers remain usable if they cannot play HLS.
-  const image = document.createElement('img');
-  image.id = 'feed'; image.src = CCTV.mjpegUrl; image.alt = 'Live CCTV camera feed';
-  video.replaceWith(image);
-}
 function updateStats(d) {
   $('connection-dot').className = `status-dot ${d.camera_ok ? 'online' : 'offline'}`;
   $('connection-label').textContent = d.camera_ok ? 'Camera online' : 'Camera offline';
@@ -100,4 +75,4 @@ if (CCTV.canOperate) {
   $('stop-alerts').onclick=()=>toggle(false); $('start-alerts').onclick=()=>toggle(true);
   $('reset-background').onclick=async()=>{try{await api('/reset_background',{method:'POST'});toast('Detection background reset');}catch(e){toast(e.message);}};
 }
-startLiveStream(); pollStats(); loadEvents(); setInterval(pollStats, 3000); setInterval(loadEvents, 60000);
+pollStats(); loadEvents(); setInterval(pollStats, 3000); setInterval(loadEvents, 60000);

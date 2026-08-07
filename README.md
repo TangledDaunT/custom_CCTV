@@ -26,7 +26,7 @@ Then open http://localhost:5000 and sign in as `admin`. Never reuse the local
 password or set `CCTV_COOKIE_SECURE=0` in production.
 
 The dashboard includes:
-- HLS live feed for lower-bandwidth, smoother remote viewing (with an MJPEG fallback for older browsers)
+- Reliable MJPEG live feed; optional HLS generation is available for tested HLS-compatible players
 - Recent events with play, flag, share, and protected clip/preview downloads
 - Filters for label, camera, and flagged state
 - Snapshot capture and sensitivity tuning
