@@ -1053,7 +1053,13 @@ def admin_users():
 @app.route("/video_feed")
 @require_login
 def video_feed():
-    return Response(generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    # Explicitly disable browser/proxy buffering and caching: an MJPEG stream
+    # must deliver every frame as it is generated.
+    response = Response(generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 @app.route("/health")

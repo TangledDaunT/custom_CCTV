@@ -1,6 +1,13 @@
 # Replace this hostname. The CCTV application provides its own user login.
 your-cctv.example.com {
     encode zstd gzip
+    # Multipart MJPEG must be flushed immediately. Otherwise an intermediary
+    # can buffer frames and make a 10 FPS stream appear to update every few
+    # seconds.
+    @live_feed path /video_feed
+    reverse_proxy @live_feed 127.0.0.1:5000 {
+        flush_interval -1
+    }
     reverse_proxy 127.0.0.1:5000
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
