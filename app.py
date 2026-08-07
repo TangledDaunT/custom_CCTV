@@ -7,8 +7,9 @@ import subprocess
 import os
 import json
 import socket
+import shutil
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, session, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -26,6 +27,8 @@ from db import (
     set_notification_pref,
     get_notification_prefs,
     insert_event,
+    insert_notification,
+    event_count_since,
     list_events,
     provision_single_admin,
     reset_user_password,
@@ -67,6 +70,7 @@ FRAME_WIDTH    = int(os.environ.get("CCTV_FRAME_WIDTH", "1280"))
 FRAME_HEIGHT   = int(os.environ.get("CCTV_FRAME_HEIGHT", "720"))
 JPEG_QUALITY   = int(os.environ.get("CCTV_JPEG_QUALITY", "80"))
 TARGET_FPS     = int(os.environ.get("CCTV_TARGET_FPS", "10"))
+CAMERA_NAME    = os.environ.get("CCTV_CAMERA_NAME", "cam0")
 
 # Video recording for alerts
 # Use the attached disk where OS isn't installed: /mnt/cctv-recordings
@@ -77,6 +81,10 @@ VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
 VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
 FFMPEG_CRF              = os.environ.get("FFMPEG_CRF", "23")
 FFMPEG_PRESET           = os.environ.get("FFMPEG_PRESET", "veryfast")
+HLS_ENABLED             = os.environ.get("CCTV_HLS_ENABLED", "1") == "1"
+HLS_DIR                 = os.environ.get("CCTV_HLS_DIR", "/var/lib/cctv/hls")
+HLS_SEGMENT_SECONDS     = int(os.environ.get("CCTV_HLS_SEGMENT_SECONDS", "2"))
+HLS_LIST_SIZE           = int(os.environ.get("CCTV_HLS_LIST_SIZE", "5"))
 
 # A motion contour is only a candidate; alerts require a confirmed object over
 # several frames. These defaults favour precision over alert volume.
@@ -110,6 +118,14 @@ WACLI_PATH    = os.environ.get("WACLI_PATH", "/home/linuxbrew/.linuxbrew/bin/wac
 ALERT_NUMBERS = [number.strip() for number in os.environ.get("CCTV_ALERT_NUMBERS", "").split(",") if number.strip()]
 SNAPSHOT_PATH = os.environ.get("CCTV_SNAPSHOT_PATH", "/var/lib/cctv/cctv_snapshot.jpg")
 
+# Health monitoring and daily summary
+HEALTH_CHECK_SECONDS = int(os.environ.get("CCTV_HEALTH_CHECK_SECONDS", "30"))
+CAMERA_STALL_SECONDS = int(os.environ.get("CCTV_CAMERA_STALL_SECONDS", "90"))
+DISK_WARN_FREE_MB = int(os.environ.get("CCTV_DISK_WARN_FREE_MB", "1024"))
+DISK_WARN_PERCENT = int(os.environ.get("CCTV_DISK_WARN_PERCENT", "10"))
+SUMMARY_HOUR = int(os.environ.get("CCTV_SUMMARY_HOUR", "7"))
+SUMMARY_STATE_FILE = os.environ.get("CCTV_SUMMARY_STATE_FILE", "/var/lib/cctv/last_daily_summary")
+
 # State file — persists stop/start across reboots
 STATE_FILE = os.environ.get("CCTV_STATE_FILE", "/var/lib/cctv/alerts_enabled")
 
@@ -139,6 +155,14 @@ _snapshot_lock = threading.Lock()
 _frame_buffer  = deque(maxlen=TARGET_FPS * PREBUFFER_SECONDS)
 _latest_bgr    = None
 _buffer_lock   = threading.Lock()
+_last_frame_at = 0.0
+_last_frame_fingerprint = None
+_last_frame_changed_at = 0.0
+_hls_process = None
+_hls_lock = threading.Lock()
+_health_lock = threading.Lock()
+_health_issues = {}
+_whatsapp_failures = 0
 
 # Alerts enabled flag — load from state file on startup
 def _load_alert_state():
@@ -266,8 +290,83 @@ def is_within_schedule() -> bool:
 def alerts_should_fire() -> bool:
     return alerts_enabled() and is_within_schedule()
 
+
+def _enabled_alert_numbers():
+    """Return recipients that have not opted out of notifications."""
+    try:
+        prefs = get_notification_prefs(VIDEO_DIR)
+        return [number for number in ALERT_NUMBERS if prefs.get(number, True)]
+    except Exception as exc:
+        logger.warning("Could not read notification preferences: %s", exc)
+        return ALERT_NUMBERS
+
+
+def _report_health_issue(code: str, message: str, active: bool):
+    """Notify once per state transition, avoiding an alert storm during an outage."""
+    with _health_lock:
+        previously_active = _health_issues.get(code, False)
+        _health_issues[code] = active
+    if active == previously_active:
+        return
+    prefix = "⚠️ CCTV health warning: " if active else "✅ CCTV health restored: "
+    logger.warning("%s%s", prefix, message)
+    for number in _enabled_alert_numbers():
+        _wacli_send_text(number, prefix + message, report_failure=False)
+
+
+def _record_whatsapp_result(ok: bool):
+    global _whatsapp_failures
+    with _health_lock:
+        _whatsapp_failures = 0 if ok else _whatsapp_failures + 1
+        failed = _whatsapp_failures >= 3
+    # A failed WhatsApp channel cannot reliably report its own failure. The
+    # state is exposed through /stats and a recovery message is sent.
+    _report_health_issue("whatsapp", "WhatsApp delivery is failing", failed)
+
+
+def _start_hls_encoder():
+    """Start a single HLS encoder fed by the already-open camera capture loop."""
+    global _hls_process
+    if not HLS_ENABLED:
+        return None
+    with _hls_lock:
+        if _hls_process and _hls_process.poll() is None:
+            return _hls_process
+        try:
+            os.makedirs(HLS_DIR, exist_ok=True)
+            playlist = os.path.join(HLS_DIR, "live.m3u8")
+            _hls_process = subprocess.Popen([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pix_fmt", "bgr24", "-video_size", f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+                "-framerate", str(TARGET_FPS), "-i", "pipe:0", "-an",
+                "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p", "-g", str(max(1, TARGET_FPS * HLS_SEGMENT_SECONDS)), "-sc_threshold", "0",
+                "-f", "hls", "-hls_time", str(HLS_SEGMENT_SECONDS), "-hls_list_size", str(HLS_LIST_SIZE),
+                "-hls_flags", "delete_segments+append_list", "-hls_segment_filename", os.path.join(HLS_DIR, "segment_%06d.ts"),
+                playlist,
+            ], stdin=subprocess.PIPE)
+            logger.info("HLS encoder started")
+        except Exception as exc:
+            _hls_process = None
+            logger.error("Could not start HLS encoder: %s", exc)
+        return _hls_process
+
+
+def _write_hls_frame(frame):
+    global _hls_process
+    process = _start_hls_encoder()
+    if not process or not process.stdin:
+        return
+    try:
+        process.stdin.write(frame.tobytes())
+    except (BrokenPipeError, OSError) as exc:
+        logger.warning("HLS encoder stopped: %s", exc)
+        with _hls_lock:
+            _hls_process = None
+
+
 # ── WhatsApp helpers ──────────────────────────────────────────────────────────
-def _wacli_send_text(number: str, message: str):
+def _wacli_send_text(number: str, message: str, report_failure: bool = True) -> bool:
     try:
         result = subprocess.run(
             [WACLI_PATH, "send", "text", "--to", number, "--message", message],
@@ -275,12 +374,23 @@ def _wacli_send_text(number: str, message: str):
         )
         if result.returncode == 0:
             logger.info(f"✅ Sent to {number}")
+            if report_failure:
+                _record_whatsapp_result(True)
+            return True
         else:
             logger.error(f"❌ wacli text error {number}: {result.stderr.strip()}")
+            if report_failure:
+                _record_whatsapp_result(False)
+            return False
     except subprocess.TimeoutExpired:
         logger.error(f"⏱ wacli timeout {number}")
+        if report_failure:
+            _record_whatsapp_result(False)
     except Exception as e:
         logger.error(f"❌ wacli exception {number}: {e}")
+        if report_failure:
+            _record_whatsapp_result(False)
+    return False
 
 
 def _wacli_send_file(number: str, path: str, caption: str):
@@ -301,7 +411,7 @@ def _wacli_send_file(number: str, path: str, caption: str):
         logger.error(f"❌ wacli file exception {number}: {e}")
 
 
-def _wacli_send_video(number: str, path: str, caption: str):
+def _wacli_send_video(number: str, path: str, caption: str) -> bool:
     """Send a video file via wacli; fall back to text on failure."""
     try:
         result = subprocess.run(
@@ -310,17 +420,19 @@ def _wacli_send_video(number: str, path: str, caption: str):
         )
         if result.returncode == 0:
             logger.info(f"✅ Video sent to {number}")
+            _record_whatsapp_result(True)
+            return True
         else:
             logger.warning(f"⚠ Video send failed {number} (rc={result.returncode})")
             logger.debug(f"wacli stderr: {result.stderr}")
             logger.debug(f"wacli stdout: {result.stdout}")
-            _wacli_send_text(number, caption)
+            return _wacli_send_text(number, caption)
     except subprocess.TimeoutExpired:
         logger.error(f"⏱ wacli video timeout {number}")
-        _wacli_send_text(number, caption)
+        return _wacli_send_text(number, caption)
     except Exception as e:
         logger.error(f"❌ wacli video exception {number}: {e}")
-        _wacli_send_text(number, caption)
+        return _wacli_send_text(number, caption)
 
 
 def send_whatsapp_alert(snapshot_frame):
@@ -337,7 +449,7 @@ def send_whatsapp_alert(snapshot_frame):
         except Exception as e:
             logger.error(f"Snapshot write failed: {e}")
 
-    for number in ALERT_NUMBERS:
+    for number in _enabled_alert_numbers():
         if snapshot_saved and os.path.exists(SNAPSHOT_PATH):
             _wacli_send_file(number, SNAPSHOT_PATH, message)
         else:
@@ -356,7 +468,7 @@ def _ensure_video_dir():
         logger.error(f"Failed to create video dir {VIDEO_DIR}: {e}")
 
 
-def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
+def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0, label=None):
     """Record a short video covering the event: include PREBUFFER then live frames for VIDEO_DURATION_SECONDS.
     After recording, send the video via WhatsApp to all recipients.
     """
@@ -457,19 +569,24 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
         except Exception as e:
             logger.error(f"Thumbnail creation failed: {e}")
 
-        # send via whatsapp
-        caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
-        for number in ALERT_NUMBERS:
-            if os.path.exists(mp4_path):
-                _wacli_send_video(number, mp4_path, caption)
-            else:
-                _wacli_send_text(number, caption)
-
-        # record event in DB
+        # Persist first so every outbound delivery can be tied to this event.
+        event_id = None
         try:
-            insert_event(VIDEO_DIR, mp4_path, thumb_path, avg_score)
+            event_id = insert_event(VIDEO_DIR, mp4_path, thumb_path, avg_score, CAMERA_NAME, label)
         except Exception as e:
             logger.error(f"Failed to insert event into DB: {e}")
+
+        # send via WhatsApp
+        caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
+        for number in _enabled_alert_numbers():
+            if os.path.exists(mp4_path):
+                sent = _wacli_send_video(number, mp4_path, caption)
+                if event_id is not None:
+                    insert_notification(VIDEO_DIR, event_id, number, "sent" if sent else "failed")
+            else:
+                sent = _wacli_send_text(number, caption)
+                if event_id is not None:
+                    insert_notification(VIDEO_DIR, event_id, number, "fallback_text" if sent else "failed")
 
     except Exception as e:
         logger.error(f"Failed to record/send event video: {e}")
@@ -481,15 +598,15 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
             pass
 
 
-def start_record_and_alert(contours, frame, avg_score=0.0):
+def start_record_and_alert(contours, frame, avg_score=0.0, label=None):
     # Immediate status message
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg = f"🚨 Motion detected at {ts} — recording {VIDEO_DURATION_SECONDS}s video"
-    for n in ALERT_NUMBERS:
+    for n in _enabled_alert_numbers():
         _wacli_send_text(n, msg)
 
     # Spawn recording thread to create and send video
-    t = threading.Thread(target=_record_event_and_send, args=(time.time(), contours, frame, avg_score), daemon=True)
+    t = threading.Thread(target=_record_event_and_send, args=(time.time(), contours, frame, avg_score, label), daemon=True)
     t.start()
 
 
@@ -514,9 +631,61 @@ def _video_cleanup_loop():
         time.sleep(VIDEO_CLEANUP_SECONDS)
 
 
+def _health_monitor_loop():
+    """Monitor camera freshness and recording-disk capacity without busy polling."""
+    while True:
+        now = time.time()
+        _report_health_issue("camera_disconnected", "camera is disconnected", not _camera_ok)
+        last_frame_age = now - _last_frame_at if _last_frame_at else float("inf")
+        _report_health_issue(
+            "camera_stalled",
+            f"camera frames have not changed for more than {CAMERA_STALL_SECONDS} seconds",
+            _camera_ok and (now - _last_frame_changed_at if _last_frame_changed_at else last_frame_age) > CAMERA_STALL_SECONDS,
+        )
+        try:
+            usage = shutil.disk_usage(VIDEO_DIR)
+            free_mb = usage.free // (1024 * 1024)
+            free_percent = (usage.free / usage.total) * 100 if usage.total else 0
+            _report_health_issue(
+                "disk_low",
+                f"recording disk is low ({free_mb} MB free, {free_percent:.1f}% available)",
+                free_mb < DISK_WARN_FREE_MB or free_percent < DISK_WARN_PERCENT,
+            )
+        except Exception as exc:
+            logger.error("Could not check recording disk: %s", exc)
+        time.sleep(max(5, HEALTH_CHECK_SECONDS))
+
+
+def _daily_summary_loop():
+    """Send one persisted local-time summary per calendar day."""
+    while True:
+        try:
+            now = datetime.now()
+            today = now.date().isoformat()
+            last_sent = ""
+            try:
+                with open(SUMMARY_STATE_FILE) as state_file:
+                    last_sent = state_file.read().strip()
+            except FileNotFoundError:
+                pass
+            if now.hour >= SUMMARY_HOUR and last_sent != today:
+                since = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                count = event_count_since(VIDEO_DIR, since)
+                message = "✅ CCTV daily summary: nothing unusual in the last 24 hours." if count == 0 else f"📹 CCTV daily summary: {count} event{'s' if count != 1 else ''} recorded in the last 24 hours."
+                results = [_wacli_send_text(number, message) for number in _enabled_alert_numbers()]
+                # Do not mark it sent if every delivery failed; retry on the next check.
+                if not results or any(results):
+                    os.makedirs(os.path.dirname(SUMMARY_STATE_FILE), exist_ok=True)
+                    with open(SUMMARY_STATE_FILE, "w") as state_file:
+                        state_file.write(today)
+        except Exception as exc:
+            logger.error("Daily summary failed: %s", exc)
+        time.sleep(60)
+
+
 def send_whatsapp_status(message: str):
     """Send a plain status message (stop/start confirmation) to all numbers."""
-    for number in ALERT_NUMBERS:
+    for number in _enabled_alert_numbers():
         _wacli_send_text(number, message)
 
 
@@ -700,7 +869,7 @@ def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
         return
     logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
                 verified["label"], verified["confidence"] * 100, verified["movement_px"])
-    start_record_and_alert(contours, frame, avg_score)
+    start_record_and_alert(contours, frame, avg_score, verified["label"])
 
 
 @detector.on_motion_end
@@ -719,7 +888,7 @@ def open_camera():
 
 
 def capture_loop():
-    global _latest_frame, _camera_ok
+    global _latest_frame, _camera_ok, _latest_bgr, _last_frame_at, _last_frame_fingerprint, _last_frame_changed_at
     frame_interval = 1.0 / TARGET_FPS
 
     while True:
@@ -741,6 +910,15 @@ def capture_loop():
                 logger.warning("Frame grab failed — reconnecting")
                 _camera_ok = False
                 break
+
+            if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+            now = time.time()
+            fingerprint = hashlib.blake2s(cv2.resize(frame, (32, 18)).tobytes(), digest_size=8).digest()
+            _last_frame_at = now
+            if fingerprint != _last_frame_fingerprint:
+                _last_frame_fingerprint = fingerprint
+                _last_frame_changed_at = now
 
             annotated, score, motion_active = detector.process_frame(frame)
 
@@ -769,10 +947,10 @@ def capture_loop():
                     with _buffer_lock:
                         _frame_buffer.append(annotated.copy())
                         # also update latest bgr for recorder
-                        global _latest_bgr
                         _latest_bgr = annotated.copy()
                 except Exception:
                     pass
+                _write_hls_frame(frame)
 
             elapsed    = time.monotonic() - t0
             sleep_for  = frame_interval - elapsed
@@ -1063,6 +1241,10 @@ def stats():
         alerts_enabled=alerts_enabled(),
         schedule_active=is_within_schedule(),
         schedule_label=f"{SCHEDULE_START_HOUR:02d}:00–{SCHEDULE_END_HOUR:02d}:00",
+        hls_enabled=HLS_ENABLED,
+        hls_ready=os.path.isfile(os.path.join(HLS_DIR, "live.m3u8")),
+        health_issues=[code for code, active in _health_issues.items() if active],
+        whatsapp_failures=_whatsapp_failures,
     )
     return jsonify(s)
 
@@ -1110,10 +1292,21 @@ def events():
     items = list_events(VIDEO_DIR, limit, offset, filters)
     for item in items:
         item["thumbnail_url"] = url_for("event_thumbnail", event_id=item["id"]) if item.get("thumb_path") else None
+        item["thumbnail_download_url"] = url_for("event_thumbnail", event_id=item["id"], download=1) if item.get("thumb_path") else None
         item["video_url"] = url_for("event_video", event_id=item["id"]) 
+        item["video_download_url"] = url_for("event_video", event_id=item["id"], download=1)
         item.pop("video_path", None)
         item.pop("thumb_path", None)
     return jsonify(items)
+
+
+@app.route("/live/<path:filename>")
+@require_login
+def live_hls(filename):
+    """Serve only HLS playlist/segments generated by this process to signed-in users."""
+    if filename != "live.m3u8" and not (filename.startswith("segment_") and filename.endswith(".ts")):
+        abort(404)
+    return send_from_directory(HLS_DIR, filename, conditional=True, max_age=0)
 
 
 # Flag an event (mark important)
@@ -1234,7 +1427,8 @@ def snapshot():
     try:
         cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         audit(VIDEO_DIR, _current_user()["username"], 'snapshot_taken', fname)
-        return jsonify({'url': url_for('snapshot_image', filename=fname, _external=False)})
+        url = url_for('snapshot_image', filename=fname, _external=False)
+        return jsonify({'url': url, 'download_url': url_for('snapshot_image', filename=fname, download=1, _external=False)})
     except Exception as e:
         logger.error(f"Snapshot save failed: {e}")
         return jsonify({'error': 'failed to save snapshot'}), 500
@@ -1243,7 +1437,7 @@ def snapshot():
 @app.route('/snapshot_image/<path:filename>')
 @require_login
 def snapshot_image(filename):
-    return send_from_directory(VIDEO_DIR, filename, conditional=True)
+    return send_from_directory(VIDEO_DIR, filename, conditional=True, as_attachment=request.args.get("download") == "1")
 
 
 # Notification preferences
@@ -1314,7 +1508,7 @@ def _event_media(event_id, field):
 @app.route("/events/<int:event_id>/thumbnail")
 @require_login
 def event_thumbnail(event_id):
-    return send_file(_event_media(event_id, "thumb_path"), conditional=True, max_age=3600)
+    return send_file(_event_media(event_id, "thumb_path"), conditional=True, max_age=3600, as_attachment=request.args.get("download") == "1")
 
 
 @app.route("/events/<int:event_id>/video")
@@ -1338,6 +1532,8 @@ def start_services():
         threading.Thread(target=capture_loop, daemon=True, name="capture").start()
         threading.Thread(target=whatsapp_command_listener, daemon=True, name="wa-listener").start()
         threading.Thread(target=_video_cleanup_loop, daemon=True, name="video-cleanup").start()
+        threading.Thread(target=_health_monitor_loop, daemon=True, name="health-monitor").start()
+        threading.Thread(target=_daily_summary_loop, daemon=True, name="daily-summary").start()
         _services_started = True
         logger.info("CCTV background services started")
 

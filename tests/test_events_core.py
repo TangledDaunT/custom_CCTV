@@ -54,6 +54,7 @@ def test_viewer_can_list_events(authed_viewer, app_module):
     assert isinstance(data, list)
     assert len(data) >= 1
     assert "video_url" in data[0]
+    assert "video_download_url" in data[0]
 
 
 def test_events_list_supports_filters(authed_admin, app_module):
@@ -171,8 +172,52 @@ def test_snapshot_saves_with_fake_frame(authed_admin, csrf_token, app_module):
     assert response.status_code == 200
     data = response.get_json()
     assert "url" in data
+    assert "download_url" in data
     saved = Path(app_module.VIDEO_DIR) / data["url"].rsplit("/", 1)[-1]
     assert saved.exists()
+
+    downloaded = authed_admin.get(data["download_url"])
+    assert downloaded.status_code == 200
+    assert "attachment" in downloaded.headers["Content-Disposition"]
+
+
+def test_event_media_downloads_require_login_and_are_attachments(authed_admin, app_module):
+    event_id = _seed_event(app_module)
+    anonymous = app_module.app.test_client()
+    assert anonymous.get(f"/events/{event_id}/video?download=1").status_code == 302
+
+    video = authed_admin.get(f"/events/{event_id}/video?download=1")
+    thumbnail = authed_admin.get(f"/events/{event_id}/thumbnail?download=1")
+    assert video.status_code == 200
+    assert thumbnail.status_code == 200
+    assert "attachment" in video.headers["Content-Disposition"]
+    assert "attachment" in thumbnail.headers["Content-Disposition"]
+
+
+def test_insert_event_persists_camera_and_detection_label(app_module):
+    media_dir = Path(app_module.VIDEO_DIR)
+    video = media_dir / "labelled.mp4"
+    video.write_bytes(b"fake-mp4-bytes")
+    event_id = app_module.insert_event(
+        app_module.VIDEO_DIR, str(video), score=0.8, camera="front", label="person"
+    )
+    event = app_module.event_by_id(app_module.VIDEO_DIR, event_id)
+    assert event["camera"] == "front"
+    assert event["label"] == "person"
+
+
+def test_notification_preferences_control_alert_recipients(db, app_module):
+    original = list(app_module.ALERT_NUMBERS)
+    try:
+        app_module.ALERT_NUMBERS[:] = ["111", "222"]
+        app_module.set_notification_pref(app_module.VIDEO_DIR, "111", False)
+        assert app_module._enabled_alert_numbers() == ["222"]
+    finally:
+        app_module.ALERT_NUMBERS[:] = original
+
+
+def test_hls_routes_are_private(client):
+    assert client.get("/live/live.m3u8").status_code == 302
 
 
 def test_alert_toggle_denied_for_viewer(authed_viewer, csrf_token):

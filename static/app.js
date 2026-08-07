@@ -7,6 +7,31 @@ const api = async (path, options = {}) => {
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Request failed');
   return response;
 };
+function startLiveStream() {
+  const video = $('feed');
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = CCTV.hlsUrl;
+    video.play().catch(() => {});
+    return;
+  }
+  if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({lowLatencyMode: true, liveSyncDurationCount: 3});
+    hls.loadSource(CCTV.hlsUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (data.fatal) startMjpegFallback(video);
+    });
+    return;
+  }
+  startMjpegFallback(video);
+}
+function startMjpegFallback(video) {
+  // Older browsers remain usable if they cannot play HLS.
+  const image = document.createElement('img');
+  image.id = 'feed'; image.src = CCTV.mjpegUrl; image.alt = 'Live CCTV camera feed';
+  video.replaceWith(image);
+}
 function updateStats(d) {
   $('connection-dot').className = `status-dot ${d.camera_ok ? 'online' : 'offline'}`;
   $('connection-label').textContent = d.camera_ok ? 'Camera online' : 'Camera offline';
@@ -39,10 +64,12 @@ async function loadEvents(){
       const metaHtml = `<div class="event-card-info"><strong>${formatTime(event.ts)}</strong><small>Motion score ${Number(event.score).toFixed(2)}</small></div>`;
       // action bar
       const actions = document.createElement('div'); actions.style.display='flex'; actions.style.justifyContent='space-between'; actions.style.padding='8px';
-      const playBtn = document.createElement('button'); playBtn.className='text-button'; playBtn.textContent='Play'; playBtn.onclick = ()=> openPlayer(event);
+      const playBtn = document.createElement('button'); playBtn.className='text-button'; playBtn.textContent='Play'; playBtn.onclick = (e)=> { e.stopPropagation(); openPlayer(event); };
       const flagBtn = document.createElement('button'); flagBtn.className='text-button'; flagBtn.textContent = event.flagged ? 'Unflag' : 'Flag'; flagBtn.onclick = async (e)=>{ e.stopPropagation(); try{ const res = await api(`/events/${event.id}/flag`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({flagged: !event.flagged})}); const j = await res.json(); event.flagged = j.flagged; flagBtn.textContent = event.flagged ? 'Unflag' : 'Flag'; toast('Flag updated'); }catch(err){ toast(err.message); }};
       const shareBtn = document.createElement('button'); shareBtn.className='text-button'; shareBtn.textContent='Share'; shareBtn.onclick = async (e)=>{ e.stopPropagation(); try{ const res = await api(`/events/${event.id}/share`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ttl:3600})}); const j = await res.json(); navigator.clipboard && navigator.clipboard.writeText(j.share_url).catch(()=>{}); toast('Share URL copied'); }catch(err){ toast(err.message); }};
-      actions.append(playBtn); actions.append(flagBtn); actions.append(shareBtn);
+      const downloadClip = document.createElement('a'); downloadClip.className='text-button'; downloadClip.textContent='Download clip'; downloadClip.href=event.video_download_url; downloadClip.download=''; downloadClip.onclick=(e)=>e.stopPropagation();
+      actions.append(playBtn); actions.append(flagBtn); actions.append(shareBtn); actions.append(downloadClip);
+      if (event.thumbnail_download_url) { const downloadPreview=document.createElement('a'); downloadPreview.className='text-button'; downloadPreview.textContent='Preview'; downloadPreview.href=event.thumbnail_download_url; downloadPreview.download=''; downloadPreview.onclick=(e)=>e.stopPropagation(); actions.append(downloadPreview); }
       card.innerHTML = thumb + metaHtml; card.appendChild(actions);
       card.addEventListener('click', () => openPlayer(event)); root.append(card); });
   } catch { root.innerHTML='<p class="empty-state">Could not load recordings. Try refreshing.</p>'; }
@@ -54,7 +81,7 @@ $('refresh-events').onclick=loadEvents;
 const applyFilters = ()=> loadEvents();
 if ($('apply-filters')) $('apply-filters').onclick = applyFilters;
 // snapshot
-if ($('snapshot')) $('snapshot').onclick = async ()=>{ try{ const res = await api('/snapshot',{method:'POST'}); const j = await res.json(); toast('Snapshot saved'); }catch(e){ toast(e.message); } };
+if ($('snapshot')) $('snapshot').onclick = async ()=>{ try{ const res = await api('/snapshot',{method:'POST'}); const j = await res.json(); const link=document.createElement('a'); link.href=j.download_url; link.download=''; link.click(); toast('Snapshot saved and downloaded'); }catch(e){ toast(e.message); } };
 // sensitivity slider
 if ($('sensitivity')){
   const s = $('sensitivity');
@@ -73,4 +100,4 @@ if (CCTV.canOperate) {
   $('stop-alerts').onclick=()=>toggle(false); $('start-alerts').onclick=()=>toggle(true);
   $('reset-background').onclick=async()=>{try{await api('/reset_background',{method:'POST'});toast('Detection background reset');}catch(e){toast(e.message);}};
 }
-pollStats(); loadEvents(); setInterval(pollStats, 3000); setInterval(loadEvents, 60000);
+startLiveStream(); pollStats(); loadEvents(); setInterval(pollStats, 3000); setInterval(loadEvents, 60000);

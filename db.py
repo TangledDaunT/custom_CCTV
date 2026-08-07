@@ -95,6 +95,12 @@ def ensure_db(default_dir: str) -> str:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
         if "reviewed_at" not in columns:
             conn.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT")
+        if "flagged" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
+        if "camera" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN camera TEXT DEFAULT 'cam0'")
+        if "label" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN label TEXT")
         user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         if "display_name" not in user_columns:
             conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
@@ -125,14 +131,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def insert_event(default_dir: str, video_path: str, thumb_path: Optional[str] = None, score: float = 0.0):
+def insert_event(
+    default_dir: str,
+    video_path: str,
+    thumb_path: Optional[str] = None,
+    score: float = 0.0,
+    camera: str = "cam0",
+    label: Optional[str] = None,
+):
     conn = _connection(default_dir)
     try:
-        conn.execute(
-            "INSERT INTO events (ts, video_path, thumb_path, score) VALUES (?, ?, ?, ?)",
-            (_now(), video_path, thumb_path, float(score)),
+        cur = conn.execute(
+            "INSERT INTO events (ts, video_path, thumb_path, score, camera, label) VALUES (?, ?, ?, ?, ?, ?)",
+            (_now(), video_path, thumb_path, float(score), camera, label),
         )
         conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def event_count_since(default_dir: str, since_ts: str) -> int:
+    """Return the number of events created at or after a UTC ISO timestamp."""
+    if not os.path.exists(get_db_path(default_dir)):
+        return 0
+    conn = _connection(default_dir)
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM events WHERE ts >= ?", (since_ts,)).fetchone()[0])
     finally:
         conn.close()
 

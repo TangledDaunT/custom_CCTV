@@ -5,6 +5,7 @@
   <meta name="theme-color" content="#0b0e14"><title>CCTV · {{ hostname }}</title>
   <link rel="manifest" href="/static/manifest.json">
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='live.css') }}">
   <meta name="mobile-web-app-capable" content="yes">
 </head>
 <body class="touch-friendly">
@@ -19,7 +20,7 @@
   <main class="app-shell">
     <section class="hero" aria-labelledby="live-title">
       <div class="section-heading"><div><p class="eyebrow">{{ hostname }}</p><h1 id="live-title">Live view</h1></div><span class="live-pill"><i></i> LIVE</span></div>
-      <div class="video-frame"><img id="feed" src="{{ url_for('video_feed') }}" alt="Live CCTV camera feed" role="img" aria-label="Live camera feed"></div>
+      <div class="video-frame"><video id="feed" muted autoplay playsinline aria-label="Live CCTV camera feed"></video></div>
       <div class="quick-actions" role="toolbar" aria-label="Quick actions">
         {% if user.role == 'admin' %}
         <button class="button danger" id="stop-alerts">Pause alerts</button>
@@ -58,14 +59,15 @@
     <!-- Onboarding modal -->
     <dialog id="onboard" aria-labelledby="onboard-title" aria-modal="true">
       <h3 id="onboard-title">Welcome to CCTV</h3>
-      <p style="color:var(--muted)">This device records motion-triggered clips between 11PM–6AM by default. WhatsApp alerts are used for instant notifications. If the object model isn't available the system will only use motion (safe-fail).</p>
+      <p style="color:var(--muted)">This device records motion-triggered clips between 11PM–6AM by default. WhatsApp alerts are used for instant notifications. If the object model is unavailable, alerts are paused rather than trusting raw motion.</p>
       <p style="color:var(--muted)">Controls: use the buttons above to pause/resume alerts, take snapshots, or reset detection. Adjust sensitivity to tune false positives.</p>
       <menu style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button id="dismiss-onboard" class="button secondary">Got it</button></menu>
     </dialog>
   </main>
   <dialog id="player-dialog" class="player-dialog"><button class="close-button" aria-label="Close video">×</button><video id="event-player" controls playsinline></video><p id="player-caption"></p></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role == 'admin')|tojson }} };</script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js" defer></script>
+  <script>window.CCTV = {csrfToken: {{ csrf_token|tojson }}, canOperate: {{ (user.role == 'admin')|tojson }}, hlsUrl: {{ url_for('live_hls', filename='live.m3u8')|tojson }}, mjpegUrl: {{ url_for('video_feed')|tojson }} };</script>
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>

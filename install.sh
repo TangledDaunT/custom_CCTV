@@ -17,7 +17,7 @@ echo "==> Installing CCTV app to $INSTALL_DIR (running as user: $RUN_AS_USER)"
 # (opencv-python-headless) is built with AVX2 and crashes with "Illegal
 # instruction" on older CPUs (Celeron/Pentium) that lack AVX support.
 apt-get update
-apt-get install -y python3 python3-venv python3-pip python3-opencv
+apt-get install -y python3 python3-venv python3-pip python3-opencv ffmpeg
 
 # Copy only executable application assets into /opt. Configuration and media
 # deliberately live outside the release directory and survive updates.
