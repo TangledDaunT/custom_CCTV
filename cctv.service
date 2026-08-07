@@ -21,8 +21,11 @@ SupplementaryGroups=video
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=yes
-ReadWritePaths=/var/log/cctv /var/lib/cctv /mnt/cctv-recordings
+# wacli is installed in Linuxbrew and keeps its local WhatsApp session state
+# under the service user's home directory. Keep home read-only and grant write
+# access only to wacli's own state directory.
+ProtectHome=read-only
+ReadWritePaths=/var/log/cctv /var/lib/cctv /mnt/cctv-recordings /home/__RUN_AS_USER__/.local/state/wacli
 UMask=0077
 
 [Install]
