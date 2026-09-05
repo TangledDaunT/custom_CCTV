@@ -47,14 +47,17 @@ CONFIG = {
     "disk_threshold": 95,  # Alert if disk > 95%
     "check_interval": 60,  # Check every 60 seconds
     "offline_threshold": 180,  # Alert if offline > 3 minutes
+    "power_reminder_interval": 120,  # Reminder every 2 hours (in minutes)
 
     # Monitoring state
     "state_file": os.path.expanduser("~/.local/lib/cctv/monitor_state.json"),
     "log_file": os.path.expanduser("~/.local/log/cctv/cross_monitor.log"),
 
-    # WhatsApp
+    # WhatsApp recipients
     "wacli_path": "/usr/local/bin/wacli",
-    "alert_number": "917754008079",
+    "alert_number_user": "917754008079",  # User only (technical alerts)
+    "alert_numbers_all": ["917678815222", "917754008079", "919415512543"],  # All family (power alerts)
+    "power_alert_interval": 120,  # Remind every 2 hours
 
     # Systemd service restart
     "restart_services": False,  # Set True to auto-restart crashed services
@@ -80,18 +83,40 @@ logger = logging.getLogger(__name__)
 
 class WhatsAppNotifier:
     @staticmethod
-    def send(message: str) -> bool:
+    def send_to_user(message: str) -> bool:
+        """Send technical alerts to user only."""
         try:
             result = subprocess.run(
                 [CONFIG["wacli_path"], "send", "text",
-                 "--to", CONFIG["alert_number"], "--message", message],
+                 "--to", CONFIG["alert_number_user"], "--message", message],
                 timeout=10, capture_output=True, text=True
             )
-            logger.info(f"WhatsApp sent: {result.returncode == 0}")
+            logger.info(f"WhatsApp to user sent: {result.returncode == 0}")
             return result.returncode == 0
         except Exception as e:
             logger.error(f"WhatsApp failed: {e}")
             return False
+
+    @staticmethod
+    def send_to_all_numbers(message: str) -> bool:
+        """Send power/family alerts to all 3 numbers."""
+        success = True
+        for number in CONFIG["alert_numbers_all"]:
+            try:
+                result = subprocess.run(
+                    [CONFIG["wacli_path"], "send", "text",
+                     "--to", number, "--message", message],
+                    timeout=10, capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    logger.info(f"WhatsApp sent to {number}")
+                else:
+                    logger.error(f"WhatsApp failed for {number}")
+                    success = False
+            except Exception as e:
+                logger.error(f"WhatsApp to {number} failed: {e}")
+                success = False
+        return success
 
 
 class SystemMonitor:
@@ -257,6 +282,8 @@ class CrossMonitor:
     def __init__(self):
         self.state = self._load_state()
         self.last_alerts = {}
+        self.power_failure_start_time = {}  # Track when power failure started
+        self.last_reminder_sent = {}  # Track last reminder time
 
     def _load_state(self) -> Dict:
         """Load monitoring state."""
@@ -351,57 +378,115 @@ class CrossMonitor:
         return local_status
 
     def check_remote_system(self, host_config: Dict):
-        """Check remote system health."""
+        """Check remote system health with power failure reminders."""
         host_label = host_config["label"]
         logger.info(f"Checking remote: {host_label}...")
 
         status = RemoteMonitor.get_remote_status(host_config)
 
-        # Check if unreachable
+        # Check if unreachable - POWER FAILURE
         if not status["reachable"]:
             logger.error(f"HOST UNREACHABLE: {host_label}")
 
-            # Check if this is a new outage
-            last_status = self.state["hosts_status"].get(host_label, {})
-            was_reachable = last_status.get("reachable", True)
+            # Track power failure start time
+            now = datetime.now()
+            if host_label not in self.power_failure_start_time:
+                # New power failure
+                self.power_failure_start_time[host_label] = now
+                self.last_reminder_sent[host_label] = None
 
-            if was_reachable or self._should_send_alert(f"offline_{host_label}", 5):
-                WhatsAppNotifier.send(
-                    f"🚨 HOST DOWN\n"
+                logger.warning(f"NEW POWER FAILURE: {host_label} at {now}")
+
+                # Send IMMEDIATE alert to ALL 3 numbers
+                WhatsAppNotifier.send_to_all_numbers(
+                    f"🚨 {host_config['label']} is DOWN\n"
+                    f"Please switch on the computer\n"
+                    f"Time: {now.strftime('%H:%M:%S')}\n"
+                    f"Location: {host_config['label']}"
+                )
+
+                # Send technical details to user only
+                WhatsAppNotifier.send_to_user(
+                    f"📊 POWER FAILURE DETAILS\n"
                     f"Machine: {host_label}\n"
                     f"IP: {host_config['ip']}\n"
                     f"Status: UNREACHABLE\n"
-                    f"Time: {datetime.now().strftime('%H:%M:%S')}\n"
-                    f"Power failure or network issue?"
+                    f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Power failure or network issue suspected\n"
+                    f"Will remind every 2 hours"
                 )
-                self._mark_alert_sent(f"offline_{host_label}")
+
+            else:
+                # Check if we need to send reminder (every 2 hours)
+                failure_start = self.power_failure_start_time[host_label]
+                hours_down = (now - failure_start).total_seconds() / 3600
+                last_reminder = self.last_reminder_sent.get(host_label)
+
+                should_remind = False
+
+                if last_reminder is None:
+                    # First reminder after 2 hours
+                    if hours_down >= 2:
+                        should_remind = True
+                else:
+                    # Subsequent reminders every 2 hours
+                    hours_since_last = (now - last_reminder).total_seconds() / 3600
+                    if hours_since_last >= 2:
+                        should_remind = True
+
+                if should_remind:
+                    self.last_reminder_sent[host_label] = now
+                    total_hours = int(hours_down)
+
+                    logger.warning(f"POWER REMINDER: {host_label} down for {total_hours}h")
+
+                    # Send reminder to ALL 3 numbers
+                    WhatsAppNotifier.send_to_all_numbers(
+                        f"⏰ REMINDER: {host_config['label']} still down\n"
+                        f"Okay, please turn it on\n"
+                        f"Down for: {total_hours} hours\n"
+                        f"Time: {now.strftime('%H:%M:%S')}"
+                    )
 
         else:
-            # Host is reachable
+            # Host is reachable - ONLINE
             logger.info(f"✓ {host_label} is online")
 
             # Check if it was previously offline
             last_status = self.state["hosts_status"].get(host_label, {})
             was_reachable = last_status.get("reachable", True)
 
-            if not was_reachable:
-                # Host recovered
-                WhatsAppNotifier.send(
-                    f"✅ HOST RECOVERED\n"
-                    f"Machine: {host_label}\n"
-                    f"IP: {host_config['ip']}\n"
-                    f"Status: ONLINE\n"
-                    f"Uptime: {status.get('uptime', 'N/A')}"
-                )
-                self._mark_alert_sent(f"online_{host_label}")
+            if not was_reachable or host_label in self.power_failure_start_time:
+                # Host recovered from power failure
+                failure_start = self.power_failure_start_time.get(host_label)
+                downtime_hours = 0
 
-            # Check services
+                if failure_start:
+                    downtime_hours = (datetime.now() - failure_start).total_seconds() / 3600
+
+                logger.info(f"HOST RECOVERED: {host_label} after {downtime_hours:.1f}h")
+
+                # Send recovery alert to ALL 3 numbers
+                WhatsAppNotifier.send_to_all_numbers(
+                    f"✅ {host_config['label']} is back ONLINE\n"
+                    f"Uptime: {status.get('uptime', 'N/A')}\n"
+                    f"Down for: {downtime_hours:.1f} hours\n"
+                    f"Time: {datetime.now().strftime('%H:%M:%S')}"
+                )
+
+                # Clear power failure tracking
+                if host_label in self.power_failure_start_time:
+                    del self.power_failure_start_time[host_label]
+                if host_label in self.last_reminder_sent:
+                    del self.last_reminder_sent[host_label]
+
+            # Check services - send to USER only
             for service, is_active in status.get("services", {}).items():
                 if not is_active:
                     logger.error(f"SERVICE DOWN: {service} on {host_label}")
 
                     if self._should_send_alert(f"service_down_{host_label}_{service}", 10):
-                        WhatsAppNotifier.send(
+                        WhatsAppNotifier.send_to_user(
                             f"⚠️ SERVICE DOWN\n"
                             f"Machine: {host_label}\n"
                             f"Service: {service}\n"
@@ -410,15 +495,10 @@ class CrossMonitor:
                         )
                         self._mark_alert_sent(f"service_down_{host_label}_{service}")
 
-                        # Try to restart if configured
-                        if CONFIG["restart_services"]:
-                            logger.info(f"Attempting restart of {service}...")
-                            # Would need similar logic on remote host
-
-            # Check high CPU on remote
+            # Check high CPU on remote - send to USER only
             if status.get("cpu") and status["cpu"] > CONFIG["cpu_threshold"]:
                 if self._should_send_alert(f"remote_high_cpu_{host_label}", 30):
-                    WhatsAppNotifier.send(
+                    WhatsAppNotifier.send_to_user(
                         f"⚠️ REMOTE HIGH CPU\n"
                         f"Machine: {host_label}\n"
                         f"CPU: {status['cpu']:.1f}%\n"

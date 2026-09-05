@@ -57,17 +57,37 @@ logger = logging.getLogger(__name__)
 
 class WhatsAppNotifier:
     @staticmethod
-    def send(message: str) -> bool:
+    def send_to_user(message: str) -> bool:
+        """Send to user only (technical details)."""
         try:
             result = subprocess.run(
                 [CONFIG["wacli_path"], "send", "text",
-                 "--to", CONFIG["alert_number"], "--message", message],
+                 "--to", CONFIG["alert_number_user"], "--message", message],
                 timeout=10, capture_output=True, text=True
             )
             return result.returncode == 0
         except Exception as e:
-            logger.error(f"WhatsApp failed: {e}")
+            logger.error(f"WhatsApp to user failed: {e}")
             return False
+
+    @staticmethod
+    def send_to_all_numbers(message: str) -> bool:
+        """Send to all family (power alerts)."""
+        success = True
+        for number in CONFIG["alert_numbers_all"]:
+            try:
+                result = subprocess.run(
+                    [CONFIG["wacli_path"], "send", "text",
+                     "--to", number, "--message", message],
+                    timeout=10, capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    success = False
+                    logger.error(f"WhatsApp failed for {number}")
+            except Exception as e:
+                logger.error(f"WhatsApp to {number} failed: {e}")
+                success = False
+        return success
 
 
 class ChecksumManager:
