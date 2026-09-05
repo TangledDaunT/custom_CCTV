@@ -258,21 +258,31 @@ class SnapshotSyncer:
         for i in range(0, len(snapshots), CONFIG["batch_size"]):
             batch = snapshots[i:i + CONFIG["batch_size"]]
 
-            # Create temporary file list
+            # Create temporary file list with relative paths
             temp_file = f"/tmp/rsync_list_{os.getpid()}.txt"
+            source_dir = Path(CONFIG["server_video_dir"])
             with open(temp_file, 'w') as f:
                 for p in batch:
-                    f.write(f"{p}\n")
+                    # Convert absolute path to relative path from source directory
+                    try:
+                        rel_path = p.relative_to(source_dir)
+                        f.write(f"{rel_path}\n")
+                    except ValueError:
+                        # Path is not relative to source_dir, skip it
+                        logger.warning(f"Skipping file outside source directory: {p}")
+                        continue
 
             try:
                 # Use rsync with --files-from
+                # Syntax: rsync -av --files-from=LIST SOURCE_DIR/ DEST/
                 cmd = [
                     "rsync", "-av", "--timeout=60",
                     "-e", f"ssh -i {CONFIG['ssh_key_path']}",
-                    "--include=*.jpg", "--include=*.jpeg", "--include=*.png",
-                    "--exclude=*.mp4", "--exclude=*.avi", "--exclude=*.mkv",
                     "--files-from=" + temp_file,
                     "--no-relative",
+                    "--include=*.jpg", "--include=*.jpeg", "--include=*.png",
+                    "--exclude=*.mp4", "--exclude=*.avi", "--exclude=*.mkv",
+                    str(Path(CONFIG["server_video_dir"])) + "/",  # Trailing slash = copy contents
                     f"{CONFIG['laptop_user']}@{CONFIG['laptop_host']}:{CONFIG['laptop_remote_dir']}/"
                 ]
 
