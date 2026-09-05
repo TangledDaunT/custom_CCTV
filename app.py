@@ -252,12 +252,26 @@ def verify_moving_object(initial_frame):
     return None
 
 # ── Schedule helper ───────────────────────────────────────────────────────────
-def is_within_schedule() -> bool:
-    """Verified events are monitored around the clock."""
+SCHEDULE_START_HOUR = int(os.environ.get("CCTV_SCHEDULE_START_HOUR", "23"))  # 11 PM
+SCHEDULE_END_HOUR   = int(os.environ.get("CCTV_SCHEDULE_END_HOUR", "6"))      # 6 AM
+
+def is_within_alert_schedule() -> bool:
+    """WhatsApp alerts only between SCHEDULE_START_HOUR and SCHEDULE_END_HOUR."""
+    now = datetime.now()
+    hour = now.hour
+    # Handle overnight schedule (e.g., 23:00 to 06:00)
+    if SCHEDULE_START_HOUR >= SCHEDULE_END_HOUR:
+        return hour >= SCHEDULE_START_HOUR or hour < SCHEDULE_END_HOUR
+    else:
+        return SCHEDULE_START_HOUR <= hour < SCHEDULE_END_HOUR
+
+def motion_detection_enabled() -> bool:
+    """Motion detection is always enabled (24/7)."""
     return True
 
 def alerts_should_fire() -> bool:
-    return alerts_enabled() and is_within_schedule()
+    """WhatsApp alerts only during scheduled hours AND when alerts enabled."""
+    return alerts_enabled() and is_within_alert_schedule()
 
 # ── WhatsApp helpers ──────────────────────────────────────────────────────────
 def _wacli_send_text(number: str, message: str):
@@ -349,7 +363,7 @@ def _ensure_video_dir():
         logger.error(f"Failed to create video dir {VIDEO_DIR}: {e}")
 
 
-def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
+def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0, send_whatsapp=True):
     """Record a short video covering the event: include PREBUFFER then live frames for VIDEO_DURATION_SECONDS.
     After recording, send the video via WhatsApp to all recipients.
     """
@@ -450,15 +464,18 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
         except Exception as e:
             logger.error(f"Thumbnail creation failed: {e}")
 
-        # send via whatsapp
-        caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
-        for number in ALERT_NUMBERS:
-            if os.path.exists(mp4_path):
-                _wacli_send_video(number, mp4_path, caption)
-            else:
-                _wacli_send_text(number, caption)
+        # send via whatsapp (only if send_whatsapp flag is True)
+        if send_whatsapp and ALERT_NUMBERS:
+            caption = f"🚨 Motion event recorded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (score {avg_score:.3f})"
+            for number in ALERT_NUMBERS:
+                if os.path.exists(mp4_path):
+                    _wacli_send_video(number, mp4_path, caption)
+                else:
+                    _wacli_send_text(number, caption)
+        elif not send_whatsapp:
+            logger.info("WhatsApp alert skipped (daytime mode)")
 
-        # record event in DB
+        # record event in DB (always)
         try:
             insert_event(VIDEO_DIR, mp4_path, thumb_path, avg_score)
         except Exception as e:
@@ -474,15 +491,10 @@ def _record_event_and_send(start_ts, contours, initial_frame, avg_score=0.0):
             logger.warning("Final writer cleanup failed for %s: %s", avi_path, exc)
 
 
-def start_record_and_alert(contours, frame, avg_score=0.0):
-    # Immediate status message
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"🚨 Motion detected at {ts} — recording {VIDEO_DURATION_SECONDS}s video"
-    for n in ALERT_NUMBERS:
-        _wacli_send_text(n, msg)
-
+def start_record_and_alert(contours, frame, avg_score=0.0, send_whatsapp=True):
     # Spawn recording thread to create and send video
-    t = threading.Thread(target=_record_event_and_send, args=(time.time(), contours, frame, avg_score), daemon=True)
+    # WhatsApp alerts controlled by send_whatsapp parameter
+    t = threading.Thread(target=_record_event_and_send, args=(time.time(), contours, frame, avg_score, send_whatsapp), daemon=True)
     t.start()
 
 
@@ -679,9 +691,10 @@ def whatsapp_command_listener():
 # ── Motion callbacks ──────────────────────────────────────────────────────────
 @detector.on_motion_start
 def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
-    if not alerts_should_fire():
-        logger.info("Motion detected — skipping alert (alerts disabled)")
+    # Always check for motion 24/7
+    if not motion_detection_enabled():
         return
+
     logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
     if _dnn_net is None:
         logger.error("Motion suppressed: object model unavailable (fail-closed)")
@@ -690,9 +703,21 @@ def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
     if not verified:
         logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
         return
-    logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
+
+    logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording event",
                 verified["label"], verified["confidence"] * 100, verified["movement_px"])
-    start_record_and_alert(contours, frame, avg_score)
+
+    # Always record the event (24/7)
+    # But only send WhatsApp alerts during scheduled hours (night)
+    should_send_alert = alerts_should_fire()
+
+    if should_send_alert:
+        logger.info("Sending WhatsApp alert (night schedule active)")
+    else:
+        logger.info("Recording only (daytime — WhatsApp alerts paused)")
+
+    # Start recording (with or without WhatsApp alerts)
+    start_record_and_alert(contours, frame, avg_score, send_whatsapp=should_send_alert)
 
 
 @detector.on_motion_end
@@ -741,8 +766,8 @@ def capture_loop():
             if not alerts_enabled():
                 overlay = "ALERTS STOPPED (send 'start' on WhatsApp)"
                 color   = (0, 0, 200)
-            elif not is_within_schedule():
-                overlay = "ALERTS PAUSED (6AM-11PM)"
+            elif not is_within_alert_schedule():
+                overlay = "ALERTS PAUSED (6AM-11PM) — Recording only"
                 color   = (100, 100, 255)
             else:
                 overlay = None
@@ -1059,7 +1084,7 @@ def stats():
     s.update(
         camera_ok=_camera_ok,
         alerts_enabled=alerts_enabled(),
-        schedule_active=is_within_schedule(),
+        schedule_active=is_within_alert_schedule(),
         schedule_label="24/7",
     )
     return jsonify(s)
