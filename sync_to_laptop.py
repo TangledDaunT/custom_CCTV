@@ -28,6 +28,7 @@ CONFIG = {
     "laptop_host": os.environ.get("CCTV_LAPTOP_HOST", "100.99.161.57"),
     "laptop_user": os.environ.get("CCTV_LAPTOP_USER", "shreyansh"),
     "laptop_remote_dir": os.environ.get("CCTV_REMOTE_DIR", "/mnt/external/cctv_snapshots"),
+    "ssh_key_path": os.environ.get("CCTV_SSH_KEY", os.path.expanduser("~/.ssh/id_rsa_cctv_sync")),
 
     # Sync settings
     "max_age_hours": 24,  # Only sync files younger than this
@@ -205,6 +206,7 @@ class SnapshotSyncer:
 
         cmd = [
             "ssh",
+            "-i", CONFIG["ssh_key_path"],
             "-o", "ConnectTimeout=10",
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
@@ -239,7 +241,8 @@ class SnapshotSyncer:
         # Ensure remote directory exists
         try:
             subprocess.run([
-                "ssh", f"{CONFIG['laptop_user']}@{CONFIG['laptop_host']}",
+                "ssh", "-i", CONFIG["ssh_key_path"],
+                f"{CONFIG['laptop_user']}@{CONFIG['laptop_host']}",
                 f"mkdir -p {CONFIG['laptop_remote_dir']}"
             ], check=True, timeout=10, capture_output=True)
         except Exception as e:
@@ -265,6 +268,7 @@ class SnapshotSyncer:
                 # Use rsync with --files-from
                 cmd = [
                     "rsync", "-av", "--timeout=60",
+                    "-e", f"ssh -i {CONFIG['ssh_key_path']}",
                     "--include=*.jpg", "--include=*.jpeg", "--include=*.png",
                     "--exclude=*.mp4", "--exclude=*.avi", "--exclude=*.mkv",
                     "--files-from=" + temp_file,

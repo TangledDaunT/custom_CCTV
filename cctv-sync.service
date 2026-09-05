@@ -6,8 +6,8 @@ Requires=cctv.service
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=shreyansh
+Group=shreyansh
 EnvironmentFile=/etc/cctv/cctv.env
 ExecStart=/usr/local/bin/cctv_sync_snapshots.py --interval 300
 Restart=always
