@@ -58,7 +58,7 @@
     <!-- Onboarding modal -->
     <dialog id="onboard" aria-labelledby="onboard-title" aria-modal="true">
       <h3 id="onboard-title">Welcome to CCTV</h3>
-      <p style="color:var(--muted)">This device records motion-triggered clips between 11PM–6AM by default. WhatsApp alerts are used for instant notifications. If the object model isn't available the system will only use motion (safe-fail).</p>
+      <p style="color:var(--muted)">This device monitors around the clock. Verified person or vehicle movement records a 30-second clip and sends a WhatsApp alert. If the object model is unavailable, alerts are safely paused instead of trusting raw motion.</p>
       <p style="color:var(--muted)">Controls: use the buttons above to pause/resume alerts, take snapshots, or reset detection. Adjust sensitivity to tune false positives.</p>
       <menu style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button id="dismiss-onboard" class="button secondary">Got it</button></menu>
     </dialog>
