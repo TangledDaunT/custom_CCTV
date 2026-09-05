@@ -71,7 +71,7 @@ TARGET_FPS     = int(os.environ.get("CCTV_TARGET_FPS", "10"))
 # Video recording for alerts
 # Use the attached disk where OS isn't installed: /mnt/cctv-recordings
 VIDEO_DIR                = os.environ.get("VIDEO_DIR", "/mnt/cctv-recordings/cctv_videos")
-VIDEO_DURATION_SECONDS   = 30
+VIDEO_DURATION_SECONDS   = 30  # every verified event produces a 30-second clip
 PREBUFFER_SECONDS        = 5
 VIDEO_CLEANUP_SECONDS    = 3600  # run cleanup every hour
 VIDEO_MAX_AGE_SECONDS    = 24 * 3600  # files older than this are deleted
@@ -101,15 +101,10 @@ MOTION_FRAMES_TRIGGER   = 8      # needs 8 consecutive frames = 0.8s of solid mo
 MOTION_BLUR_SIZE        = 11     # was 21 — less blur = finer detail picked up
 MOTION_VAR_THRESHOLD    = 16     # was 40 — MOG2 more sensitive to subtle changes
 
-# Schedule — alerts only between 11PM and 6AM
-SCHEDULE_START_HOUR = int(os.environ.get("CCTV_SCHEDULE_START_HOUR", "23"))
-SCHEDULE_END_HOUR   = int(os.environ.get("CCTV_SCHEDULE_END_HOUR", "6"))
-
 # WhatsApp
 WACLI_PATH    = os.environ.get("WACLI_PATH", "/home/linuxbrew/.linuxbrew/bin/wacli")
 ALERT_NUMBERS = [number.strip() for number in os.environ.get("CCTV_ALERT_NUMBERS", "").split(",") if number.strip()]
 SNAPSHOT_PATH = os.environ.get("CCTV_SNAPSHOT_PATH", "/var/lib/cctv/cctv_snapshot.jpg")
-DISABLE_OBJECT_FILTER = os.environ.get("DISABLE_OBJECT_FILTER", "0") == "1"
 
 # State file — persists stop/start across reboots
 STATE_FILE = os.environ.get("CCTV_STATE_FILE", "/var/lib/cctv/alerts_enabled")
@@ -186,17 +181,14 @@ detector = MotionDetector(
 
 # Load object detection model (MobileNet-SSD) for person/vehicle filtering
 _dnn_net = None
-if DISABLE_OBJECT_FILTER:
-    logger.warning("Object filter disabled via DISABLE_OBJECT_FILTER=1; running in motion-only mode")
-else:
-    try:
-        _dnn_net = ensure_mobilenet(VIDEO_DIR)
-        if _dnn_net is not None:
-            logger.info("MobileNet-SSD loaded for object filtering")
-        else:
-            logger.error("MobileNet-SSD not available; alerts are fail-closed until the model is provisioned")
-    except Exception as e:
-        logger.error(f"Failed to initialize object detection model: {e}")
+try:
+    _dnn_net = ensure_mobilenet(VIDEO_DIR)
+    if _dnn_net is not None:
+        logger.info("MobileNet-SSD loaded for object filtering")
+    else:
+        logger.error("MobileNet-SSD not available; alerts are fail-closed until the model is provisioned")
+except Exception as e:
+    logger.error(f"Failed to initialize object detection model: {e}")
 
 
 def detect_person_vehicle(frame, net):
@@ -261,12 +253,8 @@ def verify_moving_object(initial_frame):
 
 # ── Schedule helper ───────────────────────────────────────────────────────────
 def is_within_schedule() -> bool:
-    hour = datetime.now().hour
-    if SCHEDULE_START_HOUR == SCHEDULE_END_HOUR:
-        return True
-    if SCHEDULE_START_HOUR < SCHEDULE_END_HOUR:
-        return SCHEDULE_START_HOUR <= hour < SCHEDULE_END_HOUR
-    return hour >= SCHEDULE_START_HOUR or hour < SCHEDULE_END_HOUR
+    """Verified events are monitored around the clock."""
+    return True
 
 def alerts_should_fire() -> bool:
     return alerts_enabled() and is_within_schedule()
@@ -692,22 +680,18 @@ def whatsapp_command_listener():
 @detector.on_motion_start
 def handle_motion_start(timestamp, contours, frame, avg_score=0.0):
     if not alerts_should_fire():
-        reason = "alerts disabled" if not alerts_enabled() else "outside schedule"
-        logger.info(f"Motion detected — skipping alert ({reason})")
+        logger.info("Motion detected — skipping alert (alerts disabled)")
         return
-    if DISABLE_OBJECT_FILTER:
-        logger.info(f"Motion candidate: {len(contours)} region(s) — object filter disabled, recording and alerting")
-    else:
-        logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
-        if _dnn_net is None:
-            logger.error("Motion suppressed: object model unavailable (fail-closed)")
-            return
-        verified = verify_moving_object(frame)
-        if not verified:
-            logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
-            return
-        logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
-                    verified["label"], verified["confidence"] * 100, verified["movement_px"])
+    logger.info(f"Motion candidate: {len(contours)} region(s) — verifying object movement")
+    if _dnn_net is None:
+        logger.error("Motion suppressed: object model unavailable (fail-closed)")
+        return
+    verified = verify_moving_object(frame)
+    if not verified:
+        logger.info("Motion suppressed: no moving person/vehicle confirmed across frames")
+        return
+    logger.info("Verified %s (%.0f%% confidence, %spx movement) — recording and alerting",
+                verified["label"], verified["confidence"] * 100, verified["movement_px"])
     start_record_and_alert(contours, frame, avg_score)
 
 
@@ -1076,7 +1060,7 @@ def stats():
         camera_ok=_camera_ok,
         alerts_enabled=alerts_enabled(),
         schedule_active=is_within_schedule(),
-        schedule_label=f"{SCHEDULE_START_HOUR:02d}:00–{SCHEDULE_END_HOUR:02d}:00",
+        schedule_label="24/7",
     )
     return jsonify(s)
 
