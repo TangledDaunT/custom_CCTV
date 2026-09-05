@@ -128,7 +128,7 @@ See [CCTV_SYNC_SYSTEM.md](CCTV_SYNC_SYSTEM.md) for complete documentation.
 ## Notes
 - Runtime configuration lives in `/etc/cctv/cctv.env`; see
   [`cctv.env.example`](cctv.env.example). Camera resolution, FPS, media location,
-  media location, and WhatsApp recipients are environment settings.
+  and WhatsApp recipients are environment settings.
 - The initial account is the bootstrap admin. The environment bootstrap
   password is used only while no database users exist; remove it after the
   first successful login.
