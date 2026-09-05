@@ -1,0 +1,23 @@
+[Unit]
+Description=CCTV Vision Batch Processor (Daily 11AM-12:30PM)
+After=network.target
+
+[Service]
+Type=oneshot
+User=shreyansh
+Group=shreyansh
+WorkingDirectory=/home/shreyansh
+ExecStart=/usr/local/bin/vision_batch_processor.py
+StandardOutput=journal
+StandardError=journal
+
+# Timeout settings (90 minutes max)
+TimeoutStartSec=5400
+TimeoutStopSec=60
+
+# Resource limits (transcriber paused, so more available)
+MemoryMax=6G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
