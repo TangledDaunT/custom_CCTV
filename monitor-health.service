@@ -1,0 +1,19 @@
+[Unit]
+Description=CCTV Redundancy Manager (Check HDD/SSD failover)
+After=network.target
+
+[Service]
+Type=simple
+User=shreyansh
+Group=shreyansh
+WorkingDirectory=%h
+ExecStart=%h/bin/sync_redundancy_manager.py --watch
+Restart=always
+RestartSec=30
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=20%
+
+[Install]
+WantedBy=default.target

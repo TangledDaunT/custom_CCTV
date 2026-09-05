@@ -1,0 +1,19 @@
+[Unit]
+Description=CCTV Cross-Machine Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=shreyansh
+Group=shreyansh
+WorkingDirectory=%h
+ExecStart=%h/bin/cross_machine_monitor.py
+Restart=always
+RestartSec=60
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=10%
+
+[Install]
+WantedBy=default.target
