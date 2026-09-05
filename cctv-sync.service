@@ -21,6 +21,9 @@ ProtectHome=read-only
 ReadWritePaths=/var/log/cctv /var/lib/cctv /mnt/cctv-recordings /tmp
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# Environment
+Environment="CCTV_SYNC_LOG=/var/log/cctv/cctv_sync.log"
+
 # Resource limits
 LimitNOFILE=65536
 MemoryMax=256M
